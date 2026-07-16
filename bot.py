@@ -4,7 +4,6 @@ import os
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-import hashlib
 
 import requests
 from aiogram import Bot, Dispatcher, types
@@ -38,8 +37,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ SUPABASE ----------
+# ---------- ФУНКЦИИ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ (без пароля) ----------
 def get_user(telegram_id: int) -> Optional[Dict]:
+    """Проверяет, есть ли пользователь в БД (для статистики, не для авторизации)"""
     try:
         resp = supabase.table("users").select("*").eq("id", telegram_id).execute()
         if resp.data and len(resp.data) > 0:
@@ -50,7 +50,11 @@ def get_user(telegram_id: int) -> Optional[Dict]:
         return None
 
 def add_user(telegram_id: int, username: str = "") -> bool:
+    """Добавляет пользователя в БД (для статистики)"""
     try:
+        # Проверяем, есть ли уже
+        if get_user(telegram_id):
+            return True
         supabase.table("users").insert({"id": telegram_id, "username": username}).execute()
         return True
     except Exception as e:
@@ -58,6 +62,7 @@ def add_user(telegram_id: int, username: str = "") -> bool:
         return False
 
 def remove_user(telegram_id: int) -> bool:
+    """Удаляет пользователя из БД (только админ)"""
     try:
         supabase.table("users").delete().eq("id", telegram_id).execute()
         return True
@@ -66,34 +71,15 @@ def remove_user(telegram_id: int) -> bool:
         return False
 
 def get_all_users() -> List[Dict]:
+    """Возвращает всех пользователей (только админ)"""
     try:
-        resp = supabase.table("users").select("*").eq("is_active", True).execute()
+        resp = supabase.table("users").select("*").execute()
         return resp.data
     except Exception as e:
         logging.error(f"Supabase get_all_users error: {e}")
         return []
 
-def get_password_hash() -> str:
-    try:
-        resp = supabase.table("settings").select("value").eq("key", "access_password").execute()
-        if resp.data and len(resp.data) > 0:
-            return resp.data[0]["value"]
-        default_hash = hashlib.sha256("1234".encode()).hexdigest()
-        supabase.table("settings").insert({"key": "access_password", "value": default_hash}).execute()
-        return default_hash
-    except Exception as e:
-        logging.error(f"Supabase get_password_hash error: {e}")
-        return hashlib.sha256("1234".encode()).hexdigest()
-
-def set_password_hash(new_password: str) -> bool:
-    try:
-        new_hash = hashlib.sha256(new_password.encode()).hexdigest()
-        supabase.table("settings").update({"value": new_hash}).eq("key", "access_password").execute()
-        return True
-    except Exception as e:
-        logging.error(f"Supabase set_password_hash error: {e}")
-        return False
-
+# ---------- ФУНКЦИИ ДЛЯ АЛЕРТОВ (без изменений) ----------
 def get_alerts() -> List[Dict]:
     try:
         resp = supabase.table("alerts").select("*").eq("is_active", True).execute()
@@ -122,7 +108,7 @@ def remove_alert(alert_id: int) -> bool:
         logging.error(f"Supabase remove_alert error: {e}")
         return False
 
-# ---------- ПОЛУЧЕНИЕ КУРСОВ ----------
+# ---------- ПОЛУЧЕНИЕ КУРСОВ (без изменений) ----------
 def get_cbr_rates() -> Dict[str, float]:
     url = "https://www.cbr-xml-daily.ru/daily_json.js"
     try:
@@ -247,54 +233,33 @@ def convert_menu_keyboard():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
-# ---------- АВТОРИЗАЦИЯ ----------
-waiting_for_password = {}
-waiting_for_convert = {}
-
-async def check_auth(message: Message) -> bool:
-    user = get_user(message.from_user.id)
-    if user:
-        return True
-    await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
-    return False
-
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    if user:
-        rates = get_all_rates(force=True)
-        text = "👋 **Привет, сотрудник!**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
-        await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
-        return
-    await message.answer("🔐 **Введите 4-значный пароль для доступа к боту:**", parse_mode="Markdown")
-    waiting_for_password[user_id] = True
+    # Добавляем пользователя в БД (для статистики)
+    add_user(message.from_user.id, message.from_user.username or "")
+    rates = get_all_rates(force=True)
+    text = "👋 **Привет, сотрудник!**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
+    await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 @dp.message(Command("kurs"))
 async def kurs_cmd(message: Message):
-    if not await check_auth(message):
-        return
     rates = get_all_rates(force=True)
     text = format_rates(rates, show_title=True)
     await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 @dp.message(Command("convert"))
 async def convert_cmd(message: Message):
-    if not await check_auth(message):
-        return
     await message.answer("Выбери направление конвертации:", reply_markup=convert_menu_keyboard())
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    if not await check_auth(message):
-        return
     text = (
         "📋 **Доступные действия:**\n\n"
         "• Нажми «Все курсы» для обновления.\n"
         "• Нажми «Конвертация» и выбери пару.\n"
         "• Для админов есть доп. команды:\n"
-        "  /set_password, /add_user, /remove_user, /list_users,\n"
+        "  /add_user, /remove_user, /list_users,\n"
         "  /add_alert, /list_alerts, /remove_alert"
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -320,7 +285,7 @@ async def help_callback(callback: CallbackQuery):
         "• Нажми «Все курсы» для обновления.\n"
         "• Нажми «Конвертация» и выбери пару.\n"
         "• Для админов есть доп. команды:\n"
-        "  /set_password, /add_user, /remove_user, /list_users,\n"
+        "  /add_user, /remove_user, /list_users,\n"
         "  /add_alert, /list_alerts, /remove_alert"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -343,22 +308,12 @@ async def convert_pair_callback(callback: CallbackQuery):
     await callback.message.answer(f"💱 **Конвертация {from_cur} → {to_cur}**\nВведите сумму в {from_cur}:", parse_mode="Markdown")
     waiting_for_convert[callback.from_user.id] = {"from": from_cur, "to": to_cur}
 
+# ---------- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ (для ввода суммы) ----------
+waiting_for_convert = {}
+
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
-    if user_id in waiting_for_password:
-        entered = message.text.strip()
-        stored_hash = get_password_hash()
-        if hashlib.sha256(entered.encode()).hexdigest() == stored_hash:
-            del waiting_for_password[user_id]
-            add_user(user_id, message.from_user.username or "")
-            rates = get_all_rates(force=True)
-            text = "✅ **Доступ разрешён!**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
-            await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-        else:
-            await message.answer("❌ **Неверный пароль. Попробуйте ещё раз.**", parse_mode="Markdown")
-        return
-
     if user_id in waiting_for_convert:
         try:
             amount = float(message.text.replace(',', '.'))
@@ -416,30 +371,16 @@ async def handle_text(message: Message):
         await message.answer(text, parse_mode="Markdown", reply_markup=convert_menu_keyboard())
         return
 
+    # Если просто текст без ожидания
     await message.answer("Используйте кнопки меню или команды:\n/start, /kurs, /convert, /help")
 
-# ---------- АДМИН-КОМАНДЫ ----------
-@dp.message(Command("set_password"))
-async def set_password_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Пример: `/set_password 5678`", parse_mode="Markdown")
-        return
-    new_pass = args[1].strip()
-    if len(new_pass) != 4 or not new_pass.isdigit():
-        await message.answer("❌ Пароль должен быть ровно 4 цифры.")
-        return
-    if set_password_hash(new_pass):
-        await message.answer(f"✅ Пароль изменён на `{new_pass}`")
-    else:
-        await message.answer("❌ Ошибка при смене пароля.")
+# ---------- АДМИН-КОМАНДЫ (только для ADMIN_ID) ----------
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 @dp.message(Command("add_user"))
 async def add_user_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     args = message.text.split()
@@ -452,13 +393,13 @@ async def add_user_cmd(message: Message):
         await message.answer("❌ Укажите числовой ID.")
         return
     if add_user(user_id):
-        await message.answer(f"✅ Пользователь {user_id} добавлен.")
+        await message.answer(f"✅ Пользователь {user_id} добавлен в базу.")
     else:
         await message.answer("❌ Ошибка при добавлении пользователя.")
 
 @dp.message(Command("remove_user"))
 async def remove_user_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     args = message.text.split()
@@ -477,21 +418,21 @@ async def remove_user_cmd(message: Message):
 
 @dp.message(Command("list_users"))
 async def list_users_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     users = get_all_users()
     if not users:
         await message.answer("Список пользователей пуст.")
         return
-    text = "👥 **Авторизованные пользователи:**\n"
+    text = "👥 **Пользователи:**\n"
     for u in users:
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("add_alert"))
 async def add_alert_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     args = message.text.split()
@@ -517,7 +458,7 @@ async def add_alert_cmd(message: Message):
 
 @dp.message(Command("list_alerts"))
 async def list_alerts_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     alerts = get_alerts()
@@ -531,7 +472,7 @@ async def list_alerts_cmd(message: Message):
 
 @dp.message(Command("remove_alert"))
 async def remove_alert_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для администратора.")
         return
     args = message.text.split()
