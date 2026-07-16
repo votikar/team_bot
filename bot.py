@@ -1,61 +1,143 @@
 import asyncio
-import json
 import logging
 import os
 import time
 from datetime import datetime
-from pathlib import Path
+from typing import Optional, List, Dict, Any
+import hashlib
 
 import requests
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import F
+from supabase import create_client, Client
 
-BOT_TOKEN = "8221747840:AAHWUVECN07_ldY8aLutcr9qLnsKtRt45Uc"
-ADMIN_ID = 8891085561
+# ---------- НАСТРОЙКИ (читаем из переменных окружения) ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения")
 
-# ---------- Чтение дельт из переменных окружения (с запасными значениями) ----------
-def get_delta_from_env(key, default):
-    try:
-        val = os.environ.get(key)
-        if val is not None:
-            return float(val)
-    except:
-        pass
-    return default
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Не заданы SUPABASE_URL или SUPABASE_KEY")
 
-deltas = {
-    "delta_rub_to_usdt": get_delta_from_env("DELTA_RUB_USDT", 0.30),
-    "delta_usdt_to_cny": get_delta_from_env("DELTA_USDT_CNY", 0.10),
-    "delta_usdt_to_rub": get_delta_from_env("DELTA_USDT_RUB", 0.20),
-}
+# ---------- ПОДКЛЮЧЕНИЕ К SUPABASE ----------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Кеш для курсов ----------
-_cache = {
-    "usdt_rub": None,
-    "usdt_cny": None,
-    "timestamp": None,
-    "last_successful_cny": None
-}
+# ---------- КЕШ ДЛЯ КУРСОВ ----------
+_cache = {"rates": {}, "last_cny": None}
 CACHE_TTL = 60
 
-# ---------- Отправка ошибки админу ----------
-async def notify_admin_error(error_text):
+# ---------- ЛОГИРОВАНИЕ ----------
+logging.basicConfig(level=logging.INFO)
+
+# ---------- ИНИЦИАЛИЗАЦИЯ БОТА ----------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ SUPABASE ----------
+def get_user(telegram_id: int) -> Optional[Dict]:
     try:
-        bot = Bot(token=BOT_TOKEN)
-        await bot.send_message(ADMIN_ID, f"⚠️ **Ошибка бота:**\n{error_text}")
-        await bot.session.close()
-    except:
-        pass
+        resp = supabase.table("users").select("*").eq("id", telegram_id).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        return None
+    except Exception as e:
+        logging.error(f"Supabase get_user error: {e}")
+        return None
 
-# ---------- Получение курсов ----------
-def get_usdt_rub_rate(force=False):
-    now = datetime.now()
-    if not force and _cache["timestamp"] is not None and (now - _cache["timestamp"]).seconds < CACHE_TTL:
-        if _cache["usdt_rub"] is not None:
-            return _cache["usdt_rub"]
+def add_user(telegram_id: int, username: str = "") -> bool:
+    try:
+        supabase.table("users").insert({"id": telegram_id, "username": username}).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Supabase add_user error: {e}")
+        return False
 
+def remove_user(telegram_id: int) -> bool:
+    try:
+        supabase.table("users").delete().eq("id", telegram_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Supabase remove_user error: {e}")
+        return False
+
+def get_all_users() -> List[Dict]:
+    try:
+        resp = supabase.table("users").select("*").eq("is_active", True).execute()
+        return resp.data
+    except Exception as e:
+        logging.error(f"Supabase get_all_users error: {e}")
+        return []
+
+def get_password_hash() -> str:
+    try:
+        resp = supabase.table("settings").select("value").eq("key", "access_password").execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]["value"]
+        default_hash = hashlib.sha256("1234".encode()).hexdigest()
+        supabase.table("settings").insert({"key": "access_password", "value": default_hash}).execute()
+        return default_hash
+    except Exception as e:
+        logging.error(f"Supabase get_password_hash error: {e}")
+        return hashlib.sha256("1234".encode()).hexdigest()
+
+def set_password_hash(new_password: str) -> bool:
+    try:
+        new_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        supabase.table("settings").update({"value": new_hash}).eq("key", "access_password").execute()
+        return True
+    except Exception as e:
+        logging.error(f"Supabase set_password_hash error: {e}")
+        return False
+
+def get_alerts() -> List[Dict]:
+    try:
+        resp = supabase.table("alerts").select("*").eq("is_active", True).execute()
+        return resp.data
+    except Exception as e:
+        logging.error(f"Supabase get_alerts error: {e}")
+        return []
+
+def add_alert(pair: str, threshold: float, direction: str) -> bool:
+    try:
+        supabase.table("alerts").insert({
+            "pair": pair,
+            "threshold": threshold,
+            "direction": direction
+        }).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Supabase add_alert error: {e}")
+        return False
+
+def remove_alert(alert_id: int) -> bool:
+    try:
+        supabase.table("alerts").update({"is_active": False}).eq("id", alert_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Supabase remove_alert error: {e}")
+        return False
+
+# ---------- ПОЛУЧЕНИЕ КУРСОВ ----------
+def get_cbr_rates() -> Dict[str, float]:
+    url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "USD": data["Valute"]["USD"]["Value"],
+            "CNY": data["Valute"]["CNY"]["Value"]
+        }
+    except Exception as e:
+        logging.error(f"ЦБ РФ error: {e}")
+        return {"USD": None, "CNY": None}
+
+def get_usdt_rub_rapira() -> Optional[float]:
     url = "https://api.rapira.net/open/market/rates"
     try:
         resp = requests.get(url, timeout=10)
@@ -63,359 +145,417 @@ def get_usdt_rub_rate(force=False):
         data = resp.json()
         for item in data.get("data", []):
             if item.get("symbol") == "USDT/RUB":
-                rate = float(item.get("askPrice", 0))
-                _cache["usdt_rub"] = rate
-                _cache["timestamp"] = now
-                return rate
+                return float(item.get("askPrice", 0))
         return None
     except Exception as e:
-        logging.error(f"Rapira error: {e}")
-        asyncio.create_task(notify_admin_error(f"Rapira не отвечает: {e}"))
+        logging.error(f"Rapira USDT/RUB error: {e}")
         return None
 
-def get_usdt_cny_rate(force=False):
-    now = datetime.now()
-    if not force and _cache["timestamp"] is not None and (now - _cache["timestamp"]).seconds < CACHE_TTL:
-        if _cache["usdt_cny"] is not None:
-            return _cache["usdt_cny"]
-
-    # 1. Пробуем Bybit
+def get_usdt_cny_bybit() -> Optional[float]:
+    url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDTCNY"
     try:
-        url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDTCNY"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("retCode") == 0:
                 ticker = data["result"]["list"][0]
-                rate = float(ticker["lastPrice"])
-                _cache["usdt_cny"] = rate
-                _cache["last_successful_cny"] = rate
-                _cache["timestamp"] = now
-                logging.info(f"CNY rate from Bybit: {rate}")
-                return rate
+                return float(ticker["lastPrice"])
+        return None
     except Exception as e:
-        logging.warning(f"Bybit USDT/CNY failed: {e}")
+        logging.error(f"Bybit USDT/CNY error: {e}")
+        return None
 
-    # 2. Пробуем CoinGecko (резерв)
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=cny"
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 429:
-                logging.warning(f"CoinGecko rate limit, attempt {attempt+1}/3, waiting 3s")
-                time.sleep(3)
-                continue
-            resp.raise_for_status()
+def get_usd_cny_bybit() -> Optional[float]:
+    url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDCNY"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
             data = resp.json()
-            rate = float(data["tether"]["cny"])
-            _cache["usdt_cny"] = rate
-            _cache["last_successful_cny"] = rate
-            _cache["timestamp"] = now
-            logging.info(f"CNY rate from CoinGecko: {rate}")
-            return rate
-        except Exception as e:
-            logging.warning(f"CoinGecko attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-
-    # 3. Если всё упало, возвращаем последний успешный курс
-    if _cache["last_successful_cny"] is not None:
-        logging.warning("Using cached CNY rate")
-        return _cache["last_successful_cny"]
-
-    # 4. Ничего не получилось
-    asyncio.create_task(notify_admin_error("Не удалось получить курс CNY ни из одного источника"))
-    return None
-
-# ---------- Функции конвертации ----------
-def convert_rub_to_usdt_cny(amount_rub):
-    usdt_rate = get_usdt_rub_rate()
-    cny_rate = get_usdt_cny_rate()
-    if usdt_rate is None or cny_rate is None:
+            if data.get("retCode") == 0:
+                ticker = data["result"]["list"][0]
+                return float(ticker["lastPrice"])
         return None
-    usdt_rate_with_delta = usdt_rate + deltas["delta_rub_to_usdt"]
-    cny_rate_with_delta = cny_rate + deltas["delta_usdt_to_cny"]
-    usdt = amount_rub / usdt_rate_with_delta
-    cny = usdt * cny_rate_with_delta
-    return {
-        "amount_rub": amount_rub,
-        "usdt": usdt,
-        "cny": cny,
-    }
-
-def convert_usdt_to_rub(amount_usdt):
-    usdt_rate = get_usdt_rub_rate()
-    if usdt_rate is None:
+    except Exception as e:
+        logging.error(f"Bybit USD/CNY error: {e}")
         return None
-    rate_with_delta = usdt_rate - deltas["delta_usdt_to_rub"]
-    if rate_with_delta < 0:
-        rate_with_delta = 0
-    rub = amount_usdt * rate_with_delta
-    return {
-        "amount_usdt": amount_usdt,
-        "rub": rub,
-    }
 
-# ---------- Инициализация бота ----------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+def get_all_rates(force=False) -> Dict[str, Any]:
+    now = datetime.now()
+    if not force and _cache["rates"] and _cache["rates"].get("timestamp") and (now - _cache["rates"]["timestamp"]).seconds < CACHE_TTL:
+        return _cache["rates"]
 
-waiting_for_rub = {}
-waiting_for_usdt = {}
+    result = {}
+    cbr = get_cbr_rates()
+    if cbr["USD"] and cbr["USD"] > 0:
+        result["RUB/USD"] = 1 / cbr["USD"]
+    else:
+        result["RUB/USD"] = None
+    if cbr["CNY"] and cbr["CNY"] > 0:
+        result["RUB/CNY"] = 1 / cbr["CNY"]
+    else:
+        result["RUB/CNY"] = None
 
-async def set_default_commands():
-    await bot.set_my_commands([
-        BotCommand(command="course", description="📈 Текущий курс USDT/RUB и USDT/CNY"),
-        BotCommand(command="convert_rub", description="💱 Конвертировать рубли → USDT/CNY"),
-        BotCommand(command="convert_usdt", description="💰 Конвертировать USDT → рубли"),
-        BotCommand(command="show_deltas", description="🔧 Показать текущие дельты (админ)"),
-        BotCommand(command="help", description="❓ Справка")
-    ])
+    usdt_rub = get_usdt_rub_rapira()
+    result["RUB/USDT"] = usdt_rub
 
-# ---------- Обработчики команд ----------
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Курс", callback_data="course")],
-        [InlineKeyboardButton(text="💱 Рубли → USDT/CNY", callback_data="convert_rub")],
-        [InlineKeyboardButton(text="💰 USDT → рубли", callback_data="convert_usdt")],
+    usdt_cny = get_usdt_cny_bybit()
+    result["USDT/CNY"] = usdt_cny
+
+    usd_cny = get_usd_cny_bybit()
+    if usd_cny is None and result["RUB/USD"] and result["RUB/CNY"]:
+        usd_cny = result["RUB/CNY"] / result["RUB/USD"]
+    result["USD/CNY"] = usd_cny
+
+    result["timestamp"] = now
+    _cache["rates"] = result
+    return result
+
+# ---------- ФУНКЦИИ ДЛЯ КРАСИВОГО ВЫВОДА ----------
+def format_rates(rates: Dict, show_title=True) -> str:
+    now = datetime.now().strftime("%d.%m.%Y, %H:%M")
+    lines = []
+    if show_title:
+        lines.append(f"📊 **Курсы на {now}**")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    val = rates.get("RUB/USD")
+    lines.append(f"🇷🇺 RUB/USD: **{val:.2f}** ₽" if val else "🇷🇺 RUB/USD: ❌")
+    val = rates.get("RUB/USDT")
+    lines.append(f"🇷🇺 RUB/USDT: **{val:.2f}** ₽" if val else "🇷🇺 RUB/USDT: ❌")
+    val = rates.get("RUB/CNY")
+    lines.append(f"🇷🇺 RUB/CNY: **{val:.2f}** ₽" if val else "🇷🇺 RUB/CNY: ❌")
+    val = rates.get("USDT/CNY")
+    lines.append(f"🇨🇳 USDT/CNY: **{val:.2f}** ¥" if val else "🇨🇳 USDT/CNY: ❌")
+    val = rates.get("USD/CNY")
+    lines.append(f"🇺🇸 USD/CNY: **{val:.2f}** ¥" if val else "🇺🇸 USD/CNY: ❌")
+    return "\n".join(lines)
+
+# ---------- КЛАВИАТУРА МЕНЮ ----------
+def main_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Все курсы", callback_data="show_rates")],
+        [InlineKeyboardButton(text="💱 Конвертация", callback_data="convert_menu")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
     ])
-    # При старте сразу показываем курс
-    rub_rate = get_usdt_rub_rate(force=True)
-    cny_rate = get_usdt_cny_rate(force=True)
-    now = datetime.now().strftime("%d.%m.%Y, %H:%M")
-    course_text = ""
-    if rub_rate is not None:
-        course_text = f"\n📈 **Курс на {now}**\n🇺🇸 USDT/RUB: **{rub_rate:.2f}** ₽"
-        if cny_rate is not None:
-            course_text += f"\n🇨🇳 USDT/CNY: **{cny_rate:.2f}** ¥"
-        else:
-            course_text += "\n🇨🇳 USDT/CNY: ❌"
-    else:
-        course_text = "\n❌ Не удалось получить курс"
 
-    await message.answer(
-        f"👋 Привет! Я бот для конвертации криптовалют.\n\n"
-        f"Используй кнопки ниже или команды из меню.{course_text}",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+def convert_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="RUB → USD", callback_data="conv_RUB_USD"),
+         InlineKeyboardButton(text="RUB → USDT", callback_data="conv_RUB_USDT")],
+        [InlineKeyboardButton(text="RUB → CNY", callback_data="conv_RUB_CNY"),
+         InlineKeyboardButton(text="USDT → CNY", callback_data="conv_USDT_CNY")],
+        [InlineKeyboardButton(text="USD → CNY", callback_data="conv_USD_CNY")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+
+# ---------- АВТОРИЗАЦИЯ ----------
+waiting_for_password = {}
+waiting_for_convert = {}
+
+async def check_auth(message: Message) -> bool:
+    user = get_user(message.from_user.id)
+    if user:
+        return True
+    await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+    return False
+
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if user:
+        rates = get_all_rates(force=True)
+        text = "👋 **Привет, сотрудник!**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
+        await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+        return
+    await message.answer("🔐 **Введите 4-значный пароль для доступа к боту:**", parse_mode="Markdown")
+    waiting_for_password[user_id] = True
+
+@dp.message(Command("kurs"))
+async def kurs_cmd(message: Message):
+    if not await check_auth(message):
+        return
+    rates = get_all_rates(force=True)
+    text = format_rates(rates, show_title=True)
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+@dp.message(Command("convert"))
+async def convert_cmd(message: Message):
+    if not await check_auth(message):
+        return
+    await message.answer("Выбери направление конвертации:", reply_markup=convert_menu_keyboard())
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    if not await check_auth(message):
+        return
+    text = (
+        "📋 **Доступные действия:**\n\n"
+        "• Нажми «Все курсы» для обновления.\n"
+        "• Нажми «Конвертация» и выбери пару.\n"
+        "• Для админов есть доп. команды:\n"
+        "  /set_password, /add_user, /remove_user, /list_users,\n"
+        "  /add_alert, /list_alerts, /remove_alert"
     )
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-@dp.callback_query(F.data == "course")
-async def course_callback(callback: CallbackQuery):
+# ---------- ОБРАБОТКА ИНЛАЙН-КНОПОК ----------
+@dp.callback_query(F.data == "show_rates")
+async def show_rates_callback(callback: CallbackQuery):
     await callback.answer()
-    await course_cmd(callback.message)
+    rates = get_all_rates(force=True)
+    text = format_rates(rates, show_title=True)
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-@dp.callback_query(F.data == "convert_rub")
-async def convert_rub_callback(callback: CallbackQuery):
+@dp.callback_query(F.data == "convert_menu")
+async def convert_menu_callback(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer("Введите сумму в рублях (например, 10000):")
-    waiting_for_rub[callback.from_user.id] = True
-
-@dp.callback_query(F.data == "convert_usdt")
-async def convert_usdt_callback(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer("Введите сумму в USDT (например, 500):")
-    waiting_for_usdt[callback.from_user.id] = True
+    await callback.message.edit_text("Выбери направление конвертации:", reply_markup=convert_menu_keyboard())
 
 @dp.callback_query(F.data == "help")
 async def help_callback(callback: CallbackQuery):
     await callback.answer()
-    await help_cmd(callback.message)
-
-@dp.message(Command("course"))
-async def course_cmd(message: Message):
-    rub_rate = get_usdt_rub_rate(force=True)
-    cny_rate = get_usdt_cny_rate(force=True)
-    now = datetime.now().strftime("%d.%m.%Y, %H:%M")
-    if rub_rate is None:
-        await message.answer("❌ Не удалось получить курс USDT/RUB. Попробуйте позже.")
-        return
-    response = f"📈 **Курсы на {now}**\n\n"
-    response += f"🇺🇸 USDT/RUB: **{rub_rate:.2f}** ₽\n"
-    if cny_rate is not None:
-        response += f"🇨🇳 USDT/CNY: **{cny_rate:.2f}** ¥"
-    else:
-        response += f"🇨🇳 USDT/CNY: ❌ не удалось получить"
-    await message.answer(response, parse_mode="Markdown")
-
-@dp.message(Command("convert_rub"))
-async def convert_rub_cmd(message: Message):
-    args = message.text.split()
-    if len(args) > 1:
-        try:
-            amount = float(args[1].replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-            await process_rub_conversion(message, amount)
-        except:
-            await message.answer("❌ Введите корректное положительное число.")
-    else:
-        await message.answer("Введите сумму в рублях (например, 10000):")
-        waiting_for_rub[message.from_user.id] = True
-
-@dp.message(Command("convert_usdt"))
-async def convert_usdt_cmd(message: Message):
-    args = message.text.split()
-    if len(args) > 1:
-        try:
-            amount = float(args[1].replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-            await process_usdt_conversion(message, amount)
-        except:
-            await message.answer("❌ Введите корректное положительное число.")
-    else:
-        await message.answer("Введите сумму в USDT (например, 500):")
-        waiting_for_usdt[message.from_user.id] = True
-
-@dp.message(Command("show_deltas"))
-async def show_deltas(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
     text = (
-        f"🔧 **Текущие дельты:**\n\n"
-        f"RUB → USDT: **{deltas['delta_rub_to_usdt']:.2f}** ₽\n"
-        f"USDT → CNY: **{deltas['delta_usdt_to_cny']:.2f}** ¥\n"
-        f"USDT → RUB: **{deltas['delta_usdt_to_rub']:.2f}** ₽"
+        "📋 **Доступные действия:**\n\n"
+        "• Нажми «Все курсы» для обновления.\n"
+        "• Нажми «Конвертация» и выбери пару.\n"
+        "• Для админов есть доп. команды:\n"
+        "  /set_password, /add_user, /remove_user, /list_users,\n"
+        "  /add_alert, /list_alerts, /remove_alert"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    await message.answer(
-        "📋 **Доступные команды:**\n\n"
-        "/course – текущий курс USDT/RUB и USDT/CNY\n"
-        "/convert_rub [сумма] – конвертировать рубли в USDT и CNY\n"
-        "/convert_usdt [сумма] – конвертировать USDT в рубли\n"
-        "/show_deltas – показать текущие дельты (админ)\n"
-        "/help – эта справка\n\n"
-        "💡 Примеры:\n"
-        "/convert_rub 10000\n"
-        "/convert_usdt 500"
-    )
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery):
+    await callback.answer()
+    rates = get_all_rates(force=True)
+    text = "👋 **Главное меню**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-# ---------- Админ-команды для изменения дельт (они теперь тоже обновляют переменные окружения? Но мы не можем менять их через код, поэтому оставим как есть, но они будут менять значение в памяти, а при перезапуске вернутся к значениям из окружения. Чтобы изменения сохранялись, нужно либо хранить в базе, либо обновлять переменные через API Render. Для простоты пока оставим так: команды изменяют дельты в памяти, но при перезапуске они сбросятся к значениям из окружения. Если хотите постоянного изменения, лучше использовать файл, но тогда проблема сброса. Пока предлагаю так: пользователь меняет дельты командами, они действуют до перезапуска, а после перезапуска берутся из окружения. ----------
-@dp.message(Command("set_delta_rub_usdt"))
-async def set_delta_rub_usdt(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
+@dp.callback_query(F.data.startswith("conv_"))
+async def convert_pair_callback(callback: CallbackQuery):
+    await callback.answer()
+    pair = callback.data.split("_")[1:]
+    if len(pair) != 2:
+        await callback.message.answer("Ошибка выбора пары.")
         return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Пример: `/set_delta_rub_usdt 0.30`", parse_mode="Markdown")
-        return
-    try:
-        val = float(args[1].replace(',', '.'))
-        deltas["delta_rub_to_usdt"] = val
-        await message.answer(f"✅ Дельта RUB→USDT установлена на **{val:.2f}** ₽ (до перезапуска)")
-    except:
-        await message.answer("❌ Введите корректное число.")
+    from_cur, to_cur = pair
+    await callback.message.answer(f"💱 **Конвертация {from_cur} → {to_cur}**\nВведите сумму в {from_cur}:", parse_mode="Markdown")
+    waiting_for_convert[callback.from_user.id] = {"from": from_cur, "to": to_cur}
 
-@dp.message(Command("set_delta_usdt_cny"))
-async def set_delta_usdt_cny(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Пример: `/set_delta_usdt_cny 0.10`", parse_mode="Markdown")
-        return
-    try:
-        val = float(args[1].replace(',', '.'))
-        deltas["delta_usdt_to_cny"] = val
-        await message.answer(f"✅ Дельта USDT→CNY установлена на **{val:.2f}** ¥ (до перезапуска)")
-    except:
-        await message.answer("❌ Введите корректное число.")
-
-@dp.message(Command("set_delta_usdt_rub"))
-async def set_delta_usdt_rub(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Пример: `/set_delta_usdt_rub 0.20`", parse_mode="Markdown")
-        return
-    try:
-        val = float(args[1].replace(',', '.'))
-        deltas["delta_usdt_to_rub"] = val
-        await message.answer(f"✅ Дельта USDT→RUB установлена на **{val:.2f}** ₽ (до перезапуска)")
-    except:
-        await message.answer("❌ Введите корректное число.")
-
-# ---------- Обработка текстовых сообщений ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
-    text = message.text.strip()
+    if user_id in waiting_for_password:
+        entered = message.text.strip()
+        stored_hash = get_password_hash()
+        if hashlib.sha256(entered.encode()).hexdigest() == stored_hash:
+            del waiting_for_password[user_id]
+            add_user(user_id, message.from_user.username or "")
+            rates = get_all_rates(force=True)
+            text = "✅ **Доступ разрешён!**\n\n" + format_rates(rates, show_title=True) + "\n\nВыбери действие:"
+            await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        else:
+            await message.answer("❌ **Неверный пароль. Попробуйте ещё раз.**", parse_mode="Markdown")
+        return
 
-    if waiting_for_rub.get(user_id, False):
+    if user_id in waiting_for_convert:
         try:
-            amount = float(text.replace(',', '.'))
+            amount = float(message.text.replace(',', '.'))
             if amount <= 0:
                 raise ValueError
-            del waiting_for_rub[user_id]
-            await process_rub_conversion(message, amount)
         except:
             await message.answer("❌ Введите корректное положительное число.")
+            return
+        conv_data = waiting_for_convert.pop(user_id)
+        from_cur = conv_data["from"]
+        to_cur = conv_data["to"]
+        rates = get_all_rates(force=True)
+        result = None
+        pair_key = f"{from_cur}/{to_cur}"
+        reverse_key = f"{to_cur}/{from_cur}"
+        if pair_key in rates and rates[pair_key] is not None:
+            rate = rates[pair_key]
+            result = amount * rate
+            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу {rate:.4f}"
+        elif reverse_key in rates and rates[reverse_key] is not None:
+            rate = rates[reverse_key]
+            result = amount / rate
+            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу 1/{rate:.4f}"
+        else:
+            rub_amount = None
+            if from_cur == "RUB":
+                rub_amount = amount
+            elif from_cur == "USD" and rates.get("RUB/USD"):
+                rub_amount = amount * rates["RUB/USD"]
+            elif from_cur == "USDT" and rates.get("RUB/USDT"):
+                rub_amount = amount * rates["RUB/USDT"]
+            elif from_cur == "CNY" and rates.get("RUB/CNY"):
+                rub_amount = amount * rates["RUB/CNY"]
+            else:
+                await message.answer(f"❌ Не могу конвертировать {from_cur} → {to_cur}.")
+                return
+            if rub_amount is None:
+                await message.answer(f"❌ Не удалось получить курс для {from_cur}.")
+                return
+            if to_cur == "RUB":
+                result = rub_amount
+            elif to_cur == "USD" and rates.get("RUB/USD"):
+                result = rub_amount / rates["RUB/USD"]
+            elif to_cur == "USDT" and rates.get("RUB/USDT"):
+                result = rub_amount / rates["RUB/USDT"]
+            elif to_cur == "CNY" and rates.get("RUB/CNY"):
+                result = rub_amount / rates["RUB/CNY"]
+            else:
+                await message.answer(f"❌ Не могу конвертировать RUB → {to_cur}.")
+                return
+            if result is None:
+                await message.answer(f"❌ Не удалось получить курс для {to_cur}.")
+                return
+            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**"
+        await message.answer(text, parse_mode="Markdown", reply_markup=convert_menu_keyboard())
         return
 
-    if waiting_for_usdt.get(user_id, False):
-        try:
-            amount = float(text.replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-            del waiting_for_usdt[user_id]
-            await process_usdt_conversion(message, amount)
-        except:
-            await message.answer("❌ Введите корректное положительное число.")
+    await message.answer("Используйте кнопки меню или команды:\n/start, /kurs, /convert, /help")
+
+# ---------- АДМИН-КОМАНДЫ ----------
+@dp.message(Command("set_password"))
+async def set_password_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
         return
-
-    await message.answer("Используйте команды из меню или отправьте /help")
-
-# ---------- Конвертация с улучшенной анимацией ----------
-async def process_rub_conversion(message: Message, amount_rub):
-    loading = await message.answer("⏳ Конвертирую...")
-    await asyncio.sleep(0.3)
-    await loading.edit_text("🔄 Считаю...")
-    result = convert_rub_to_usdt_cny(amount_rub)
-    if result is None:
-        await loading.edit_text("❌ Не удалось получить курс. Попробуйте позже.")
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Пример: `/set_password 5678`", parse_mode="Markdown")
         return
-    await asyncio.sleep(0.3)
-    now = datetime.now().strftime("%d.%m.%Y, %H:%M")
-    await loading.edit_text(
-        f"💱 **Конвертация {result['amount_rub']:,.0f} ₽**\n"
-        f"🕐 {now}\n\n"
-        f"🪙 Получите: **{result['usdt']:,.2f} USDT**\n"
-        f"🇨🇳 В юанях: **{result['cny']:,.2f} CNY**\n\n"
-        f"✅ Готово!",
-        parse_mode="Markdown"
-    )
-
-async def process_usdt_conversion(message: Message, amount_usdt):
-    loading = await message.answer("⏳ Конвертирую...")
-    await asyncio.sleep(0.3)
-    await loading.edit_text("🔄 Считаю...")
-    result = convert_usdt_to_rub(amount_usdt)
-    if result is None:
-        await loading.edit_text("❌ Не удалось получить курс. Попробуйте позже.")
+    new_pass = args[1].strip()
+    if len(new_pass) != 4 or not new_pass.isdigit():
+        await message.answer("❌ Пароль должен быть ровно 4 цифры.")
         return
-    await asyncio.sleep(0.3)
-    now = datetime.now().strftime("%d.%m.%Y, %H:%M")
-    await loading.edit_text(
-        f"💰 **Конвертация {result['amount_usdt']:,.2f} USDT**\n"
-        f"🕐 {now}\n\n"
-        f"🇷🇺 Получите: **{result['rub']:,.2f} ₽**\n\n"
-        f"✅ Готово!",
-        parse_mode="Markdown"
-    )
+    if set_password_hash(new_pass):
+        await message.answer(f"✅ Пароль изменён на `{new_pass}`")
+    else:
+        await message.answer("❌ Ошибка при смене пароля.")
 
-# ---------- Запуск ----------
+@dp.message(Command("add_user"))
+async def add_user_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Пример: `/add_user 123456789`", parse_mode="Markdown")
+        return
+    try:
+        user_id = int(args[1])
+    except:
+        await message.answer("❌ Укажите числовой ID.")
+        return
+    if add_user(user_id):
+        await message.answer(f"✅ Пользователь {user_id} добавлен.")
+    else:
+        await message.answer("❌ Ошибка при добавлении пользователя.")
+
+@dp.message(Command("remove_user"))
+async def remove_user_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Пример: `/remove_user 123456789`", parse_mode="Markdown")
+        return
+    try:
+        user_id = int(args[1])
+    except:
+        await message.answer("❌ Укажите числовой ID.")
+        return
+    if remove_user(user_id):
+        await message.answer(f"✅ Пользователь {user_id} удалён.")
+    else:
+        await message.answer("❌ Ошибка при удалении пользователя.")
+
+@dp.message(Command("list_users"))
+async def list_users_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    users = get_all_users()
+    if not users:
+        await message.answer("Список пользователей пуст.")
+        return
+    text = "👥 **Авторизованные пользователи:**\n"
+    for u in users:
+        text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("add_alert"))
+async def add_alert_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) != 4:
+        await message.answer("❌ Пример: `/add_alert RUB/USD 85 above`\n"
+                             "Доступные пары: RUB/USD, RUB/USDT, RUB/CNY, USDT/CNY, USD/CNY\n"
+                             "Направление: above или below", parse_mode="Markdown")
+        return
+    pair = args[1]
+    try:
+        threshold = float(args[2].replace(',', '.'))
+    except:
+        await message.answer("❌ Неверное значение порога.")
+        return
+    direction = args[3].lower()
+    if direction not in ("above", "below"):
+        await message.answer("❌ Направление должно быть 'above' или 'below'.")
+        return
+    if add_alert(pair, threshold, direction):
+        await message.answer(f"✅ Алерт для {pair} установлен: {direction} {threshold:.2f}")
+    else:
+        await message.answer("❌ Ошибка при создании алерта.")
+
+@dp.message(Command("list_alerts"))
+async def list_alerts_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    alerts = get_alerts()
+    if not alerts:
+        await message.answer("Нет активных алертов.")
+        return
+    text = "🔔 **Активные алерты:**\n"
+    for a in alerts:
+        text += f"ID: {a['id']}, {a['pair']} {a['direction']} {a['threshold']:.2f}\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("remove_alert"))
+async def remove_alert_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Пример: `/remove_alert 1`", parse_mode="Markdown")
+        return
+    try:
+        alert_id = int(args[1])
+    except:
+        await message.answer("❌ Укажите числовой ID.")
+        return
+    if remove_alert(alert_id):
+        await message.answer(f"✅ Алерт {alert_id} удалён.")
+    else:
+        await message.answer("❌ Ошибка при удалении алерта.")
+
+# ---------- ЗАПУСК ----------
 async def main():
-    await set_default_commands()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🚀 Главное меню"),
+        BotCommand(command="kurs", description="📊 Все курсы"),
+        BotCommand(command="convert", description="💱 Конвертация"),
+        BotCommand(command="help", description="❓ Помощь")
+    ])
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
