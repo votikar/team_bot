@@ -315,61 +315,70 @@ waiting_for_convert = {}
 async def handle_text(message: Message):
     user_id = message.from_user.id
     if user_id in waiting_for_convert:
-        try:
-            amount = float(message.text.replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-        except:
-            await message.answer("❌ Введите корректное положительное число.")
-            return
-        conv_data = waiting_for_convert.pop(user_id)
-        from_cur = conv_data["from"]
-        to_cur = conv_data["to"]
-        rates = get_all_rates(force=True)
-        result = None
-        pair_key = f"{from_cur}/{to_cur}"
-        reverse_key = f"{to_cur}/{from_cur}"
-        if pair_key in rates and rates[pair_key] is not None:
-            rate = rates[pair_key]
-            result = amount * rate
-            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу {rate:.4f}"
-        elif reverse_key in rates and rates[reverse_key] is not None:
-            rate = rates[reverse_key]
-            result = amount / rate
-            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу 1/{rate:.4f}"
-        else:
-            rub_amount = None
-            if from_cur == "RUB":
-                rub_amount = amount
-            elif from_cur == "USD" and rates.get("RUB/USD"):
-                rub_amount = amount * rates["RUB/USD"]
-            elif from_cur == "USDT" and rates.get("RUB/USDT"):
-                rub_amount = amount * rates["RUB/USDT"]
-            elif from_cur == "CNY" and rates.get("RUB/CNY"):
-                rub_amount = amount * rates["RUB/CNY"]
-            else:
-                await message.answer(f"❌ Не могу конвертировать {from_cur} → {to_cur}.")
-                return
-            if rub_amount is None:
-                await message.answer(f"❌ Не удалось получить курс для {from_cur}.")
-                return
-            if to_cur == "RUB":
-                result = rub_amount
-            elif to_cur == "USD" and rates.get("RUB/USD"):
-                result = rub_amount / rates["RUB/USD"]
-            elif to_cur == "USDT" and rates.get("RUB/USDT"):
-                result = rub_amount / rates["RUB/USDT"]
-            elif to_cur == "CNY" and rates.get("RUB/CNY"):
-                result = rub_amount / rates["RUB/CNY"]
-            else:
-                await message.answer(f"❌ Не могу конвертировать RUB → {to_cur}.")
-                return
-            if result is None:
-                await message.answer(f"❌ Не удалось получить курс для {to_cur}.")
-                return
-            text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**"
-        await message.answer(text, parse_mode="Markdown", reply_markup=convert_menu_keyboard())
+    try:
+        amount = float(message.text.replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Введите корректное положительное число.")
         return
+    conv_data = waiting_for_convert.pop(user_id)
+    from_cur = conv_data["from"]
+    to_cur = conv_data["to"]
+    rates = get_all_rates(force=True)
+    result = None
+    pair_key = f"{from_cur}/{to_cur}"
+    reverse_key = f"{to_cur}/{from_cur}"
+
+    # Прямой курс: from_cur -> to_cur
+    if pair_key in rates and rates[pair_key] is not None:
+        rate = rates[pair_key]
+        result = amount / rate  # из from_cur в to_cur – деление
+        text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу {rate:.4f}"
+    # Обратный курс: to_cur -> from_cur, значит из from_cur в to_cur – умножение
+    elif reverse_key in rates and rates[reverse_key] is not None:
+        rate = rates[reverse_key]
+        result = amount * rate
+        text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**\nпо курсу {rate:.4f}"
+    else:
+        # Если прямой пары нет, пробуем через RUB (кросс-курс)
+        rub_amount = None
+        if from_cur == "RUB":
+            rub_amount = amount
+        elif from_cur == "USD" and rates.get("RUB/USD"):
+            rub_amount = amount * rates["RUB/USD"]  # USD -> RUB (умножение)
+        elif from_cur == "USDT" and rates.get("RUB/USDT"):
+            rub_amount = amount * rates["RUB/USDT"] # USDT -> RUB
+        elif from_cur == "CNY" and rates.get("RUB/CNY"):
+            rub_amount = amount * rates["RUB/CNY"]   # CNY -> RUB
+        else:
+            await message.answer(f"❌ Не могу конвертировать {from_cur} → {to_cur}.")
+            return
+
+        if rub_amount is None:
+            await message.answer(f"❌ Не удалось получить курс для {from_cur}.")
+            return
+
+        # Из RUB в целевую валюту
+        if to_cur == "RUB":
+            result = rub_amount
+        elif to_cur == "USD" and rates.get("RUB/USD"):
+            result = rub_amount / rates["RUB/USD"]   # RUB -> USD (деление)
+        elif to_cur == "USDT" and rates.get("RUB/USDT"):
+            result = rub_amount / rates["RUB/USDT"]  # RUB -> USDT
+        elif to_cur == "CNY" and rates.get("RUB/CNY"):
+            result = rub_amount / rates["RUB/CNY"]   # RUB -> CNY
+        else:
+            await message.answer(f"❌ Не могу конвертировать RUB → {to_cur}.")
+            return
+
+        if result is None:
+            await message.answer(f"❌ Не удалось получить курс для {to_cur}.")
+            return
+        text = f"💱 **{amount:.2f} {from_cur} = {result:.2f} {to_cur}**"
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=convert_menu_keyboard())
+    return
 
     # Если просто текст без ожидания
     await message.answer("Используйте кнопки меню или команды:\n/start, /kurs, /convert, /help")
