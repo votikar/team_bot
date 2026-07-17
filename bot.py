@@ -254,17 +254,20 @@ def format_course_text():
     text += f"USD/RUB: **{deltas['usd_rub']:.2f}** ₽\n"
     text += f"USDT/RUB: **{deltas['usdt_rub']:.2f}** ₽\n"
     text += f"CNY/RUB: **{deltas['cny_rub']:.2f}** ₽\n"
-    text += f"USD/CNY: **{deltas['usd_cny']:.2f}** ¥"
+    text += f"USD/CNY: **{deltas['usd_cny']:.2f}** ¥\n"
+
+    text += "\n📡 **Источники:** USD/RUB — ЦБ РФ, USDT/RUB — Rapira, CNY/RUB — ЦБ РФ, USD/CNY — Bybit/CoinGecko"
     return text
 
 # ---------- Клавиатуры ----------
-def main_menu():
+def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
-        [InlineKeyboardButton(text="💱 Конвертировать", callback_data="convert")]
+        [InlineKeyboardButton(text="💱 Конвертировать", callback_data="convert")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
 
-def convert_menu():
+def convert_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="RUB → USD", callback_data="conv_RUB_USD"),
          InlineKeyboardButton(text="USD → RUB", callback_data="conv_USD_RUB")],
@@ -347,7 +350,7 @@ async def start_cmd(message: Message):
         return
     await message.answer(
         f"🏦 Добро пожаловать, сотрудник!\n\n{format_course_text()}",
-        reply_markup=main_menu(),
+        reply_markup=main_menu_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -360,7 +363,7 @@ async def course_cmd(message: Message):
     await message.answer(
         format_course_text(),
         parse_mode="Markdown",
-        reply_markup=main_menu()
+        reply_markup=main_menu_keyboard()
     )
 
 @dp.message(Command("convert"))
@@ -369,7 +372,7 @@ async def convert_cmd(message: Message):
     if not get_user(user_id):
         await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
-    await message.answer("Выберите направление конвертации:", reply_markup=convert_menu())
+    await message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
@@ -560,7 +563,7 @@ async def handle_text(message: Message):
             await message.answer(
                 f"✅ Доступ разрешён!\n\n{format_course_text()}",
                 parse_mode="Markdown",
-                reply_markup=main_menu()
+                reply_markup=main_menu_keyboard()
             )
         else:
             await message.answer("❌ Неверный пароль. Попробуйте ещё раз.")
@@ -639,7 +642,10 @@ async def handle_text(message: Message):
         result_text += f"🔸 **С дельтой:** {result_with:.4f} {conv_type.split('_')[1]}\n\n"
         result_text += f"📌 Дельта на сегодня: {delta_val:.2f}"
 
+        # Отправляем результат и добавляем кнопку «Главное меню»
         await loading_msg.edit_text(result_text, parse_mode="Markdown")
+        # Добавляем отдельное сообщение с главным меню, чтобы пользователь мог вернуться
+        await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
         return
 
     # Если просто текст
@@ -653,25 +659,40 @@ async def refresh_cb(callback: CallbackQuery):
     get_usdt_rub_rate(force=True)
     get_cny_rub_rate(force=True)
     get_usd_cny_rate(force=True)
-    await callback.message.edit_text(
+    # Отправляем новое сообщение с обновлёнными курсами
+    await callback.message.answer(
         format_course_text(),
         parse_mode="Markdown",
-        reply_markup=main_menu()
+        reply_markup=main_menu_keyboard()
     )
+    await callback.message.delete()  # удаляем старое сообщение с кнопкой, чтобы не дублировалось
 
 @dp.callback_query(F.data == "back_to_course")
 async def back_cb(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text(
+    await callback.message.answer(
         format_course_text(),
         parse_mode="Markdown",
-        reply_markup=main_menu()
+        reply_markup=main_menu_keyboard()
     )
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_cb(callback: CallbackQuery):
+    await callback.answer()
+    # Отправляем свежие курсы и меню
+    await callback.message.answer(
+        f"🏦 Главное меню\n\n{format_course_text()}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.message.delete()
 
 @dp.callback_query(F.data == "convert")
 async def convert_cb(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text("Выберите направление конвертации:", reply_markup=convert_menu())
+    await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
+    await callback.message.delete()
 
 @dp.callback_query(F.data.startswith("conv_"))
 async def conv_choice_cb(callback: CallbackQuery):
@@ -684,6 +705,7 @@ async def conv_choice_cb(callback: CallbackQuery):
     key = f"{from_cur}_{to_cur}"
     waiting_for[callback.from_user.id] = key
     await callback.message.answer(f"💱 Введите сумму в {from_cur}:")
+    await callback.message.delete()
 
 # ---------- Запуск ----------
 async def main():
