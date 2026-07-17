@@ -120,10 +120,13 @@ def get_today_deltas():
 def update_delta(pair: str, value: float) -> bool:
     today = datetime.now().strftime("%Y-%m-%d")
     try:
+        # Получаем текущую запись на сегодня (если есть)
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
         if resp.data and len(resp.data) > 0:
+            # Обновляем только указанное поле
             supabase.table("deltas").update({pair: value}).eq("date", today).execute()
         else:
+            # Создаём новую запись с нулями и нужным полем
             default = {
                 "date": today,
                 "usd_rub": 0.0,
@@ -136,6 +139,11 @@ def update_delta(pair: str, value: float) -> bool:
         return True
     except Exception as e:
         logger.error(f"update_delta error: {e}")
+        # Дополнительно логируем для отладки
+        try:
+            bot.send_message(ADMIN_ID, f"⚠️ Ошибка при сохранении дельты: {e}")
+        except:
+            pass
         return False
 
 # ---------- Получение курсов ----------
