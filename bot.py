@@ -99,7 +99,41 @@ def get_all_users():
         return []
 
 def get_today_deltas():
+    """
+    Возвращает дельты на сегодня.
+    Сначала пробует взять из переменных окружения (если они заданы).
+    Если переменные не заданы – читает из Supabase.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Сначала пробуем взять из переменных окружения
+    env_deltas = {
+        "usd_rub": os.environ.get("DELTA_USD_RUB"),
+        "usdt_rub": os.environ.get("DELTA_USDT_RUB"),
+        "cny_rub": os.environ.get("DELTA_CNY_RUB"),
+        "usd_cny": os.environ.get("DELTA_USD_CNY"),
+    }
+    # Если хотя бы одна переменная задана – используем их (остальные берём из Supabase)
+    if any(v is not None for v in env_deltas.values()):
+        # Пробуем получить остальные из Supabase
+        try:
+            resp = supabase.table("deltas").select("*").eq("date", today).execute()
+            if resp.data and len(resp.data) > 0:
+                base = resp.data[0]
+            else:
+                base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
+        except:
+            base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
+        
+        return {
+            "date": today,
+            "usd_rub": float(env_deltas["usd_rub"]) if env_deltas["usd_rub"] is not None else base["usd_rub"],
+            "usdt_rub": float(env_deltas["usdt_rub"]) if env_deltas["usdt_rub"] is not None else base["usdt_rub"],
+            "cny_rub": float(env_deltas["cny_rub"]) if env_deltas["cny_rub"] is not None else base["cny_rub"],
+            "usd_cny": float(env_deltas["usd_cny"]) if env_deltas["usd_cny"] is not None else base["usd_cny"],
+        }
+
+    # Если переменные окружения не заданы – берём из Supabase
     try:
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
         if resp.data and len(resp.data) > 0:
@@ -118,15 +152,17 @@ def get_today_deltas():
         return {"date": today, "usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
 
 def update_delta(pair: str, value: float) -> bool:
+    """
+    Обновляет дельту в Supabase.
+    Если переменные окружения заданы – они имеют приоритет, но мы всё равно сохраняем в Supabase
+    для совместимости.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     try:
-        # Получаем текущую запись на сегодня (если есть)
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
         if resp.data and len(resp.data) > 0:
-            # Обновляем только указанное поле
             supabase.table("deltas").update({pair: value}).eq("date", today).execute()
         else:
-            # Создаём новую запись с нулями и нужным полем
             default = {
                 "date": today,
                 "usd_rub": 0.0,
@@ -139,11 +175,6 @@ def update_delta(pair: str, value: float) -> bool:
         return True
     except Exception as e:
         logger.error(f"update_delta error: {e}")
-        # Дополнительно логируем для отладки
-        try:
-            bot.send_message(ADMIN_ID, f"⚠️ Ошибка при сохранении дельты: {e}")
-        except:
-            pass
         return False
 
 # ---------- Получение курсов ----------
