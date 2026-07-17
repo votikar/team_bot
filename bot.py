@@ -642,9 +642,8 @@ async def handle_text(message: Message):
         result_text += f"🔸 **С дельтой:** {result_with:.4f} {conv_type.split('_')[1]}\n\n"
         result_text += f"📌 Дельта на сегодня: {delta_val:.2f}"
 
-        # Отправляем результат и добавляем кнопку «Главное меню»
         await loading_msg.edit_text(result_text, parse_mode="Markdown")
-        # Добавляем отдельное сообщение с главным меню, чтобы пользователь мог вернуться
+        # Отправляем кнопку «Главное меню» отдельным сообщением
         await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
         return
 
@@ -659,13 +658,11 @@ async def refresh_cb(callback: CallbackQuery):
     get_usdt_rub_rate(force=True)
     get_cny_rub_rate(force=True)
     get_usd_cny_rate(force=True)
-    # Отправляем новое сообщение с обновлёнными курсами
     await callback.message.answer(
         format_course_text(),
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
-    await callback.message.delete()  # удаляем старое сообщение с кнопкой, чтобы не дублировалось
 
 @dp.callback_query(F.data == "back_to_course")
 async def back_cb(callback: CallbackQuery):
@@ -675,24 +672,20 @@ async def back_cb(callback: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
-    await callback.message.delete()
 
 @dp.callback_query(F.data == "main_menu")
 async def main_menu_cb(callback: CallbackQuery):
     await callback.answer()
-    # Отправляем свежие курсы и меню
     await callback.message.answer(
         f"🏦 Главное меню\n\n{format_course_text()}",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
-    await callback.message.delete()
 
 @dp.callback_query(F.data == "convert")
 async def convert_cb(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
-    await callback.message.delete()
 
 @dp.callback_query(F.data.startswith("conv_"))
 async def conv_choice_cb(callback: CallbackQuery):
@@ -705,7 +698,6 @@ async def conv_choice_cb(callback: CallbackQuery):
     key = f"{from_cur}_{to_cur}"
     waiting_for[callback.from_user.id] = key
     await callback.message.answer(f"💱 Введите сумму в {from_cur}:")
-    await callback.message.delete()
 
 # ---------- Запуск ----------
 async def main():
