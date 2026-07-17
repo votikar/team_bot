@@ -99,23 +99,15 @@ def get_all_users():
         return []
 
 def get_today_deltas():
-    """
-    Возвращает дельты на сегодня.
-    Сначала пробует взять из переменных окружения (если они заданы).
-    Если переменные не заданы – читает из Supabase.
-    """
     today = datetime.now().strftime("%Y-%m-%d")
-    
-    # Сначала пробуем взять из переменных окружения
+    # Сначала пробуем переменные окружения
     env_deltas = {
         "usd_rub": os.environ.get("DELTA_USD_RUB"),
         "usdt_rub": os.environ.get("DELTA_USDT_RUB"),
         "cny_rub": os.environ.get("DELTA_CNY_RUB"),
         "usd_cny": os.environ.get("DELTA_USD_CNY"),
     }
-    # Если хотя бы одна переменная задана – используем их (остальные берём из Supabase)
     if any(v is not None for v in env_deltas.values()):
-        # Пробуем получить остальные из Supabase
         try:
             resp = supabase.table("deltas").select("*").eq("date", today).execute()
             if resp.data and len(resp.data) > 0:
@@ -124,7 +116,6 @@ def get_today_deltas():
                 base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
         except:
             base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
-        
         return {
             "date": today,
             "usd_rub": float(env_deltas["usd_rub"]) if env_deltas["usd_rub"] is not None else base["usd_rub"],
@@ -133,7 +124,6 @@ def get_today_deltas():
             "usd_cny": float(env_deltas["usd_cny"]) if env_deltas["usd_cny"] is not None else base["usd_cny"],
         }
 
-    # Если переменные окружения не заданы – берём из Supabase
     try:
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
         if resp.data and len(resp.data) > 0:
@@ -152,11 +142,6 @@ def get_today_deltas():
         return {"date": today, "usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
 
 def update_delta(pair: str, value: float) -> bool:
-    """
-    Обновляет дельту в Supabase.
-    Если переменные окружения заданы – они имеют приоритет, но мы всё равно сохраняем в Supabase
-    для совместимости.
-    """
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
@@ -243,7 +228,6 @@ def get_usd_cny_rate(force=False):
     if not force and _cache["timestamp"] and (now - _cache["timestamp"]).seconds < CACHE_TTL:
         if _cache["usd_cny"] is not None:
             return _cache["usd_cny"]
-    # Bybit
     try:
         url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDCNY"
         resp = requests.get(url, timeout=5)
@@ -257,7 +241,6 @@ def get_usd_cny_rate(force=False):
                 return rate
     except Exception as e:
         logger.warning(f"Bybit USD/CNY failed: {e}")
-    # CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=usd&vs_currencies=cny"
         resp = requests.get(url, timeout=5)
@@ -271,7 +254,7 @@ def get_usd_cny_rate(force=False):
         logger.warning(f"CoinGecko USD/CNY failed: {e}")
     return None
 
-# ---------- Формирование текста курсов и дельт ----------
+# ---------- Формирование текста курсов ----------
 def format_course_text():
     usd_rub = get_usd_rub_rate()
     usdt_rub = get_usdt_rub_rate()
@@ -298,70 +281,13 @@ def format_course_text():
     text += "\n📡 **Источники:** USD/RUB — ЦБ РФ, USDT/RUB — Rapira, CNY/RUB — ЦБ РФ, USD/CNY — Bybit/CoinGecko"
     return text
 
-# ---------- Функции конвертации с возвратом прибыли ----------
-def convert_rub_to_usd(amount, with_delta=False):
-    rate = get_usd_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usd_rub"] if with_delta else 0.0
-    effective_rate = rate + delta
-    return amount / effective_rate, effective_rate
-
-def convert_usd_to_rub(amount, with_delta=False):
-    rate = get_usd_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usd_rub"] if with_delta else 0.0
-    effective_rate = rate - delta
-    return amount * effective_rate, effective_rate
-
-def convert_rub_to_usdt(amount, with_delta=False):
-    rate = get_usdt_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usdt_rub"] if with_delta else 0.0
-    effective_rate = rate + delta
-    return amount / effective_rate, effective_rate
-
-def convert_usdt_to_rub(amount, with_delta=False):
-    rate = get_usdt_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usdt_rub"] if with_delta else 0.0
-    effective_rate = rate - delta
-    return amount * effective_rate, effective_rate
-
-def convert_rub_to_cny(amount, with_delta=False):
-    rate = get_cny_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["cny_rub"] if with_delta else 0.0
-    effective_rate = rate + delta
-    return amount / effective_rate, effective_rate
-
-def convert_cny_to_rub(amount, with_delta=False):
-    rate = get_cny_rub_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["cny_rub"] if with_delta else 0.0
-    effective_rate = rate - delta
-    return amount * effective_rate, effective_rate
-
-def convert_usd_to_cny(amount, with_delta=False):
-    rate = get_usd_cny_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usd_cny"] if with_delta else 0.0
-    effective_rate = rate + delta
-    return amount * effective_rate, effective_rate
-
-def convert_cny_to_usd(amount, with_delta=False):
-    rate = get_usd_cny_rate()
-    if rate is None:
-        return None, None
-    delta = get_today_deltas()["usd_cny"] if with_delta else 0.0
-    effective_rate = rate - delta
-    return amount / effective_rate, effective_rate
+# ---------- Конвертация ----------
+def convert_generic(amount, rate, delta, is_buy):
+    effective_rate = rate + delta if is_buy else rate - delta
+    if is_buy:
+        return amount / effective_rate, effective_rate
+    else:
+        return amount * effective_rate, effective_rate
 
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
@@ -432,7 +358,10 @@ async def help_cmd(message: Message):
         "/start – Главное меню\n"
         "/course – Показать курсы и дельты\n"
         "/convert – Открыть меню конвертации\n"
-        "/help – Эта справка"
+        "/help – Эта справка\n\n"
+        "💡 При конвертации можно указать индивидуальную дельту:\n"
+        "Введите сумму и дельту через пробел, например:\n"
+        "`1000000 1.50`"
     )
 
 # ---------- Админ-команды ----------
@@ -461,7 +390,7 @@ async def set_delta_usdt_rub(message: Message):
         return
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Пример: `/set_delta_USDT_RUB 0.30`")
+        await message.answer("❌ Пример: `/set_delta_USDT_RUB 0.35`")
         return
     try:
         val = float(args[1].replace(',', '.'))
@@ -621,89 +550,111 @@ async def handle_text(message: Message):
         await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
 
-    # Обработка чисел для конвертации
-    if re.match(r'^\d+([,.]\d+)?$', text):
-        if user_id not in waiting_for:
-            await message.answer("Сначала выберите направление конвертации через /convert.")
-            return
+    # Проверяем, ожидаем ли мы ввод для конвертации
+    if user_id not in waiting_for:
+        await message.answer("Сначала выберите направление конвертации через /convert.")
+        return
+
+    conv_type = waiting_for.get(user_id)
+    if not conv_type or not conv_type.startswith("conv_"):
+        await message.answer("Сначала выберите направление конвертации через /convert.")
+        return
+
+    # Пытаемся распарсить "сумма дельта"
+    parts = text.split()
+    if len(parts) == 2:
         try:
-            amount = float(text.replace(',', '.'))
+            amount = float(parts[0].replace(',', '.'))
+            custom_delta = float(parts[1].replace(',', '.'))
+            if amount <= 0:
+                raise ValueError
+        except:
+            await message.answer("❌ Введите корректные числа: сумма и дельта, например `1000000 1.50`")
+            return
+        # Используем индивидуальную дельту
+        use_custom_delta = True
+    elif len(parts) == 1:
+        try:
+            amount = float(parts[0].replace(',', '.'))
             if amount <= 0:
                 raise ValueError
         except:
             await message.answer("❌ Введите положительное число.")
             return
-        conv_type = waiting_for.pop(user_id)
-
-        # Анимация
-        loading_msg = await message.answer("⏳ Конвертирую...")
-
-        # Определяем, покупка или продажа
-        from_cur, to_cur = conv_type.split('_')
-        is_buy = from_cur == "RUB"  # Если из рублей – покупка, иначе продажа
-
-        # Выполняем конвертацию
-        func_map = {
-            "RUB_USD": convert_rub_to_usd,
-            "USD_RUB": convert_usd_to_rub,
-            "RUB_USDT": convert_rub_to_usdt,
-            "USDT_RUB": convert_usdt_to_rub,
-            "RUB_CNY": convert_rub_to_cny,
-            "CNY_RUB": convert_cny_to_rub,
-            "USD_CNY": convert_usd_to_cny,
-            "CNY_USD": convert_cny_to_usd,
-        }
-        convert_func = func_map.get(conv_type)
-        if not convert_func:
-            await loading_msg.edit_text("❌ Неизвестное направление.")
-            return
-
-        result_without, rate_without = convert_func(amount, with_delta=False)
-        result_with, rate_with = convert_func(amount, with_delta=True)
-
-        if result_without is None or result_with is None:
-            await loading_msg.edit_text("❌ Не удалось получить курс. Попробуйте позже.")
-            return
-
-        deltas = get_today_deltas()
-        pair_key = conv_type.replace('_', '/')
-        if "RUB" in pair_key:
-            if "USD" in pair_key:
-                delta_val = deltas["usd_rub"]
-            elif "USDT" in pair_key:
-                delta_val = deltas["usdt_rub"]
-            elif "CNY" in pair_key:
-                delta_val = deltas["cny_rub"]
-            else:
-                delta_val = 0.0
-        else:
-            if "USD" in pair_key and "CNY" in pair_key:
-                delta_val = deltas["usd_cny"]
-            else:
-                delta_val = 0.0
-
-        # Расчёт прибыли
-        if is_buy:
-            profit_abs = result_without - result_with  # в валюте результата
-        else:
-            profit_abs = result_with - result_without  # в валюте результата (рубли)
-        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
-
-        # Формируем результат
-        result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
-        result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
-        result_text += f"🔸 **С дельтой:**  {result_with:.4f} {to_cur}\n"
-        result_text += f"\n💰 **Прибыль:** {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
-        if delta_val != 0:
-            result_text += f"\n📌 Дельта на сегодня: {delta_val:.2f}"
-
-        await loading_msg.edit_text(result_text, parse_mode="Markdown")
-        # Отправляем кнопку «Главное меню» отдельным сообщением
-        await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
+        custom_delta = None
+        use_custom_delta = False
+    else:
+        await message.answer("❌ Введите сумму, либо сумму и дельту через пробел, например `1000000 1.50`")
         return
 
-    # Если просто текст
-    await message.answer("Используйте команды из меню: /start, /course, /convert, /help")
+    # Убираем ожидание
+    waiting_for.pop(user_id, None)
+
+    # Определяем направление
+    from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
+    is_buy = from_cur == "RUB"  # покупка (RUB → X) или продажа (X → RUB)
+
+    # Получаем курсы
+    if from_cur == "USD" or to_cur == "USD":
+        rate = get_usd_rub_rate()
+        delta_key = "usd_rub"
+    elif from_cur == "USDT" or to_cur == "USDT":
+        rate = get_usdt_rub_rate()
+        delta_key = "usdt_rub"
+    elif from_cur == "CNY" or to_cur == "CNY":
+        rate = get_cny_rub_rate()
+        delta_key = "cny_rub"
+    else:
+        await message.answer("❌ Неизвестная валюта.")
+        return
+
+    if rate is None:
+        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
+        return
+
+    # Стандартная дельта
+    deltas = get_today_deltas()
+    standard_delta = deltas.get(delta_key, 0.0)
+
+    # Выбираем дельту для расчёта
+    delta_used = custom_delta if use_custom_delta else standard_delta
+
+    # Анимация
+    loading_msg = await message.answer("⏳ Конвертирую...")
+
+    # Расчёт
+    if is_buy:
+        result = amount / (rate + delta_used)
+        result_without = amount / rate
+        result_with = amount / (rate + standard_delta)
+    else:
+        result = amount * (rate - delta_used)
+        result_without = amount * rate
+        result_with = amount * (rate - standard_delta)
+
+    if result is None:
+        await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
+        return
+
+    # Формируем ответ
+    result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
+    if use_custom_delta:
+        result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
+        result_text += f"🔸 **С вашей дельтой ({delta_used:.2f}):** {result:.4f} {to_cur}\n"
+        result_text += f"📌 Стандартная дельта на сегодня: {standard_delta:.2f}\n"
+        profit_abs = result_without - result if is_buy else result - result_without
+        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
+        result_text += f"💰 Прибыль от вашей дельты: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
+    else:
+        result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
+        result_text += f"🔸 **С дельтой ({standard_delta:.2f}):** {result_with:.4f} {to_cur}\n"
+        profit_abs = result_without - result_with if is_buy else result_with - result_without
+        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
+        result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
+
+    await loading_msg.edit_text(result_text, parse_mode="Markdown")
+    # Отправляем кнопку «Главное меню»
+    await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
 
 # ---------- Коллбэки ----------
 @dp.callback_query(F.data == "refresh")
@@ -750,9 +701,13 @@ async def conv_choice_cb(callback: CallbackQuery):
         await callback.message.answer("Ошибка.")
         return
     from_cur, to_cur = pair
-    key = f"{from_cur}_{to_cur}"
-    waiting_for[callback.from_user.id] = key
-    await callback.message.answer(f"💱 Введите сумму в {from_cur}:")
+    conv_key = f"conv_{from_cur}_{to_cur}"
+    waiting_for[callback.from_user.id] = conv_key
+    await callback.message.answer(
+        f"💱 Введите сумму в {from_cur}:\n"
+        "Можно указать дельту через пробел, например:\n"
+        "`1000000 1.50`"
+    )
 
 # ---------- Запуск ----------
 async def main():
