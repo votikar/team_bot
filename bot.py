@@ -12,6 +12,10 @@ from aiogram.types import BotCommand, Message, CallbackQuery, InlineKeyboardMark
 from aiogram import F
 from supabase import create_client, Client
 
+# ---------- Версия для отладки ----------
+logger = logging.getLogger(__name__)
+logger.info("BOT VERSION 20.07.2026 13:00 — с исправленным add_user_db")
+
 # ---------- Переменные окружения ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -35,10 +39,6 @@ _cache = {
     "timestamp": None,
 }
 CACHE_TTL = 30
-
-# ---------- Логирование ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ---------- Бот ----------
 bot = Bot(token=BOT_TOKEN)
@@ -74,13 +74,14 @@ def get_user(telegram_id: int):
         logger.error(f"get_user error: {e}")
         return None
 
-def add_user(telegram_id: int, username: str = ""):
+# ---------- Функция БД переименована в add_user_db ----------
+def add_user_db(telegram_id: int, username: str = ""):
     try:
-        # Используем upsert – если запись с таким id уже есть, она обновится
-        supabase.table("users").upsert({"id": telegram_id, "username": username}).execute()
+        resp = supabase.table("users").upsert({"id": telegram_id, "username": username}).execute()
+        logger.info(f"add_user_db response: {resp}")
         return True
     except Exception as e:
-        logger.error(f"add_user error: {e}")
+        logger.error(f"add_user_db error: {e}")
         return False
 
 def remove_user(telegram_id: int):
@@ -321,6 +322,7 @@ async def start_cmd(message: Message):
     if not user:
         await message.answer("🔐 Введите пароль для доступа к боту:")
         waiting_for[user_id] = "waiting_password"
+        logger.info(f"start_cmd: user {user_id} set waiting_password")
         return
     await message.answer(
         f"🏦 Добро пожаловать, сотрудник!\n\n{format_course_text()}",
@@ -475,6 +477,7 @@ async def set_password(message: Message):
     else:
         await message.answer("❌ Ошибка при смене пароля.")
 
+# ---------- Обработчик команды /add_user (оставляем с тем же именем) ----------
 @dp.message(Command("add_user"))
 async def add_user(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -486,7 +489,7 @@ async def add_user(message: Message):
         return
     try:
         new_id = int(args[1])
-        if add_user(new_id):
+        if add_user_db(new_id):  # вызываем функцию БД, а не себя
             await message.answer(f"✅ Пользователь {new_id} добавлен.")
         else:
             await message.answer("❌ Ошибка при добавлении пользователя.")
@@ -525,18 +528,25 @@ async def list_users(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста (новая логика пароля) ----------
+# ---------- Обработка текста (новая логика пароля с отладкой) ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
+    logger.info(f"handle_text: user={user_id}, text={repr(text)}")
 
     # ---- 1. Если пользователь НЕ авторизован, любой ввод проверяем как пароль ----
     if not get_user(user_id):
+        logger.info("User not authorized, checking password")
         stored_hash = get_password_hash()
-        if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
-            # Пароль верный – пытаемся добавить пользователя
-            if add_user(user_id, message.from_user.username or ""):
+        logger.info(f"stored_hash={stored_hash}")
+        input_hash = hashlib.sha256(text.encode()).hexdigest()
+        logger.info(f"input_hash={input_hash}")
+
+        if input_hash == stored_hash:
+            logger.info("Password OK, trying to add user")
+            if add_user_db(user_id, message.from_user.username or ""):
+                logger.info("User added successfully")
                 await message.answer(
                     f"✅ Доступ разрешён!\n\n{format_course_text()}",
                     parse_mode="Markdown",
@@ -546,10 +556,11 @@ async def handle_text(message: Message):
                     del waiting_for[user_id]
                 return
             else:
+                logger.error("add_user_db returned False")
                 await message.answer("❌ Ошибка при сохранении пользователя. Попробуйте позже.")
                 return
         else:
-            # Неверный пароль – даём подсказку
+            logger.info("Password BAD")
             await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
             return
 
