@@ -524,31 +524,35 @@ async def list_users(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста ----------
+# ---------- Обработка текста (новая логика пароля) ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # Ожидание пароля
-    if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
+    # ---- 1. Если пользователь НЕ авторизован, любой ввод проверяем как пароль ----
+    if not get_user(user_id):
         stored_hash = get_password_hash()
         if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
-            del waiting_for[user_id]
+            # Пароль верный
             add_user(user_id, message.from_user.username or "")
             await message.answer(
                 f"✅ Доступ разрешён!\n\n{format_course_text()}",
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard()
             )
+            if user_id in waiting_for:
+                del waiting_for[user_id]
+            return
         else:
-            await message.answer("❌ Неверный пароль. Попробуйте ещё раз.")
-        return
+            # Неверный пароль – даём подсказку
+            await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
+            return
 
-    # Если не авторизован – запрет
-    if not get_user(user_id):
-        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
-        return
+    # ---- 2. Если пользователь авторизован ----
+    # Если он ожидал пароль (маловероятно, но на всякий случай)
+    if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
+        del waiting_for[user_id]
 
     # Проверяем, ожидаем ли мы ввод для конвертации
     if user_id not in waiting_for:
@@ -560,7 +564,7 @@ async def handle_text(message: Message):
         await message.answer("Сначала выберите направление конвертации через /convert.")
         return
 
-    # Пытаемся распарсить "сумма дельта"
+    # Парсим "сумма" или "сумма дельта"
     parts = text.split()
     if len(parts) == 2:
         try:
@@ -571,7 +575,6 @@ async def handle_text(message: Message):
         except:
             await message.answer("❌ Введите корректные числа: сумма и дельта, например `1000000 1.50`")
             return
-        # Используем индивидуальную дельту
         use_custom_delta = True
     elif len(parts) == 1:
         try:
@@ -594,7 +597,7 @@ async def handle_text(message: Message):
     from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
     is_buy = from_cur == "RUB"  # покупка (RUB → X) или продажа (X → RUB)
 
-    # Получаем курсы
+    # Получаем курс и дельту
     if from_cur == "USD" or to_cur == "USD":
         rate = get_usd_rub_rate()
         delta_key = "usd_rub"
@@ -612,11 +615,8 @@ async def handle_text(message: Message):
         await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
         return
 
-    # Стандартная дельта
     deltas = get_today_deltas()
     standard_delta = deltas.get(delta_key, 0.0)
-
-    # Выбираем дельту для расчёта
     delta_used = custom_delta if use_custom_delta else standard_delta
 
     # Анимация
@@ -653,7 +653,6 @@ async def handle_text(message: Message):
         result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
 
     await loading_msg.edit_text(result_text, parse_mode="Markdown")
-    # Отправляем кнопку «Главное меню»
     await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
 
 # ---------- Коллбэки ----------
