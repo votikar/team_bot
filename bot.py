@@ -12,10 +12,6 @@ from aiogram.types import BotCommand, Message, CallbackQuery, InlineKeyboardMark
 from aiogram import F
 from supabase import create_client, Client
 
-# ---------- Версия для отладки ----------
-logger = logging.getLogger(__name__)
-logger.info("BOT VERSION 20.07.2026 13:00 — с исправленным add_user_db")
-
 # ---------- Переменные окружения ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -26,6 +22,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL или SUPABASE_KEY не заданы")
+
+# ---------- Фиксированный курс USD/CNY (опционально) ----------
+FIXED_USD_CNY = os.environ.get("FIXED_USD_CNY")
+if FIXED_USD_CNY is not None:
+    try:
+        FIXED_USD_CNY = float(FIXED_USD_CNY)
+    except:
+        FIXED_USD_CNY = None
 
 # ---------- Supabase ----------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -39,6 +43,10 @@ _cache = {
     "timestamp": None,
 }
 CACHE_TTL = 30
+
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---------- Бот ----------
 bot = Bot(token=BOT_TOKEN)
@@ -74,11 +82,9 @@ def get_user(telegram_id: int):
         logger.error(f"get_user error: {e}")
         return None
 
-# ---------- Функция БД переименована в add_user_db ----------
 def add_user_db(telegram_id: int, username: str = ""):
     try:
-        resp = supabase.table("users").upsert({"id": telegram_id, "username": username}).execute()
-        logger.info(f"add_user_db response: {resp}")
+        supabase.table("users").upsert({"id": telegram_id, "username": username}).execute()
         return True
     except Exception as e:
         logger.error(f"add_user_db error: {e}")
@@ -102,7 +108,6 @@ def get_all_users():
 
 def get_today_deltas():
     today = datetime.now().strftime("%Y-%m-%d")
-    # Сначала пробуем переменные окружения
     env_deltas = {
         "usd_rub": os.environ.get("DELTA_USD_RUB"),
         "usdt_rub": os.environ.get("DELTA_USDT_RUB"),
@@ -112,12 +117,9 @@ def get_today_deltas():
     if any(v is not None for v in env_deltas.values()):
         try:
             resp = supabase.table("deltas").select("*").eq("date", today).execute()
-            if resp.data and len(resp.data) > 0:
-                base = resp.data[0]
-            else:
-                base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
+            base = resp.data[0] if resp.data else {"usd_rub":0.0, "usdt_rub":0.0, "cny_rub":0.0, "usd_cny":0.0}
         except:
-            base = {"usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
+            base = {"usd_rub":0.0, "usdt_rub":0.0, "cny_rub":0.0, "usd_cny":0.0}
         return {
             "date": today,
             "usd_rub": float(env_deltas["usd_rub"]) if env_deltas["usd_rub"] is not None else base["usd_rub"],
@@ -125,39 +127,25 @@ def get_today_deltas():
             "cny_rub": float(env_deltas["cny_rub"]) if env_deltas["cny_rub"] is not None else base["cny_rub"],
             "usd_cny": float(env_deltas["usd_cny"]) if env_deltas["usd_cny"] is not None else base["usd_cny"],
         }
-
     try:
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
-        if resp.data and len(resp.data) > 0:
+        if resp.data:
             return resp.data[0]
-        default = {
-            "date": today,
-            "usd_rub": 0.0,
-            "usdt_rub": 0.0,
-            "cny_rub": 0.0,
-            "usd_cny": 0.0,
-        }
+        default = {"date": today, "usd_rub":0.0, "usdt_rub":0.0, "cny_rub":0.0, "usd_cny":0.0}
         supabase.table("deltas").insert(default).execute()
         return default
     except Exception as e:
         logger.error(f"get_today_deltas error: {e}")
-        return {"date": today, "usd_rub": 0.0, "usdt_rub": 0.0, "cny_rub": 0.0, "usd_cny": 0.0}
+        return {"date": today, "usd_rub":0.0, "usdt_rub":0.0, "cny_rub":0.0, "usd_cny":0.0}
 
 def update_delta(pair: str, value: float) -> bool:
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         resp = supabase.table("deltas").select("*").eq("date", today).execute()
-        if resp.data and len(resp.data) > 0:
+        if resp.data:
             supabase.table("deltas").update({pair: value}).eq("date", today).execute()
         else:
-            default = {
-                "date": today,
-                "usd_rub": 0.0,
-                "usdt_rub": 0.0,
-                "cny_rub": 0.0,
-                "usd_cny": 0.0,
-                pair: value,
-            }
+            default = {"date": today, "usd_rub":0.0, "usdt_rub":0.0, "cny_rub":0.0, "usd_cny":0.0, pair: value}
             supabase.table("deltas").insert(default).execute()
         return True
     except Exception as e:
@@ -226,34 +214,45 @@ def get_cny_rub_rate(force=False):
         return None
 
 def get_usd_cny_rate(force=False):
+    # Если задан фиксированный курс – используем его
+    if FIXED_USD_CNY is not None:
+        return FIXED_USD_CNY
+
     now = datetime.now()
     if not force and _cache["timestamp"] and (now - _cache["timestamp"]).seconds < CACHE_TTL:
         if _cache["usd_cny"] is not None:
             return _cache["usd_cny"]
+
+    # Пробуем Frankfurter API (бесплатно, без ключа)
     try:
-        url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDCNY"
+        url = "https://api.frankfurter.app/latest?from=USD&to=CNY"
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("retCode") == 0:
-                rate = float(data["result"]["list"][0]["lastPrice"])
-                _cache["usd_cny"] = rate
-                _cache["timestamp"] = now
-                logger.info(f"USD/CNY from Bybit: {rate}")
-                return rate
-    except Exception as e:
-        logger.warning(f"Bybit USD/CNY failed: {e}")
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=usd&vs_currencies=cny"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            rate = float(resp.json()["usd"]["cny"])
+            rate = data["rates"]["CNY"]
             _cache["usd_cny"] = rate
             _cache["timestamp"] = now
-            logger.info(f"USD/CNY from CoinGecko: {rate}")
+            logger.info(f"USD/CNY from Frankfurter: {rate}")
             return rate
     except Exception as e:
-        logger.warning(f"CoinGecko USD/CNY failed: {e}")
+        logger.warning(f"Frankfurter USD/CNY failed: {e}")
+
+    # Резерв: exchangerate.host
+    try:
+        url = "https://api.exchangerate.host/convert?from=USD&to=CNY"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                rate = data["result"]
+                _cache["usd_cny"] = rate
+                _cache["timestamp"] = now
+                logger.info(f"USD/CNY from exchangerate.host: {rate}")
+                return rate
+    except Exception as e:
+        logger.warning(f"exchangerate.host USD/CNY failed: {e}")
+
+    # Если ничего не получено, возвращаем None (без кросса через RUB)
     return None
 
 # ---------- Формирование текста курсов ----------
@@ -280,7 +279,7 @@ def format_course_text():
     text += f"CNY/RUB: **{deltas['cny_rub']:.2f}** ₽\n"
     text += f"USD/CNY: **{deltas['usd_cny']:.2f}** ¥\n"
 
-    text += "\n📡 **Источники:** USD/RUB — ЦБ РФ, USDT/RUB — Rapira, CNY/RUB — ЦБ РФ, USD/CNY — Bybit/CoinGecko"
+    text += "\n📡 **Источники:** USD/RUB — ЦБ РФ, USDT/RUB — Rapira, CNY/RUB — ЦБ РФ, USD/CNY — Frankfurter (Forex)"
     return text
 
 # ---------- Конвертация ----------
@@ -322,7 +321,6 @@ async def start_cmd(message: Message):
     if not user:
         await message.answer("🔐 Введите пароль для доступа к боту:")
         waiting_for[user_id] = "waiting_password"
-        logger.info(f"start_cmd: user {user_id} set waiting_password")
         return
     await message.answer(
         f"🏦 Добро пожаловать, сотрудник!\n\n{format_course_text()}",
@@ -477,9 +475,8 @@ async def set_password(message: Message):
     else:
         await message.answer("❌ Ошибка при смене пароля.")
 
-# ---------- Обработчик команды /add_user (оставляем с тем же именем) ----------
 @dp.message(Command("add_user"))
-async def add_user(message: Message):
+async def add_user_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Только для администратора.")
         return
@@ -489,7 +486,7 @@ async def add_user(message: Message):
         return
     try:
         new_id = int(args[1])
-        if add_user_db(new_id):  # вызываем функцию БД, а не себя
+        if add_user_db(new_id):
             await message.answer(f"✅ Пользователь {new_id} добавлен.")
         else:
             await message.answer("❌ Ошибка при добавлении пользователя.")
@@ -497,7 +494,7 @@ async def add_user(message: Message):
         await message.answer("❌ Укажите числовой ID.")
 
 @dp.message(Command("remove_user"))
-async def remove_user(message: Message):
+async def remove_user_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Только для администратора.")
         return
@@ -515,7 +512,7 @@ async def remove_user(message: Message):
         await message.answer("❌ Укажите числовой ID.")
 
 @dp.message(Command("list_users"))
-async def list_users(message: Message):
+async def list_users_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Только для администратора.")
         return
@@ -528,7 +525,7 @@ async def list_users(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста (новая логика пароля с отладкой) ----------
+# ---------- Обработка текста (включая пароль и конвертацию) ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -537,16 +534,9 @@ async def handle_text(message: Message):
 
     # ---- 1. Если пользователь НЕ авторизован, любой ввод проверяем как пароль ----
     if not get_user(user_id):
-        logger.info("User not authorized, checking password")
         stored_hash = get_password_hash()
-        logger.info(f"stored_hash={stored_hash}")
-        input_hash = hashlib.sha256(text.encode()).hexdigest()
-        logger.info(f"input_hash={input_hash}")
-
-        if input_hash == stored_hash:
-            logger.info("Password OK, trying to add user")
+        if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
             if add_user_db(user_id, message.from_user.username or ""):
-                logger.info("User added successfully")
                 await message.answer(
                     f"✅ Доступ разрешён!\n\n{format_course_text()}",
                     parse_mode="Markdown",
@@ -556,16 +546,13 @@ async def handle_text(message: Message):
                     del waiting_for[user_id]
                 return
             else:
-                logger.error("add_user_db returned False")
                 await message.answer("❌ Ошибка при сохранении пользователя. Попробуйте позже.")
                 return
         else:
-            logger.info("Password BAD")
             await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
             return
 
     # ---- 2. Если пользователь авторизован ----
-    # Если он ожидал пароль (маловероятно, но на всякий случай)
     if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
         del waiting_for[user_id]
 
@@ -605,12 +592,11 @@ async def handle_text(message: Message):
         await message.answer("❌ Введите сумму, либо сумму и дельту через пробел, например `1000000 1.50`")
         return
 
-    # Убираем ожидание
     waiting_for.pop(user_id, None)
 
     # Определяем направление
     from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
-    is_buy = from_cur == "RUB"  # покупка (RUB → X) или продажа (X → RUB)
+    is_buy = from_cur == "RUB"
 
     # Получаем курс и дельту
     if from_cur == "USD" or to_cur == "USD":
@@ -634,10 +620,8 @@ async def handle_text(message: Message):
     standard_delta = deltas.get(delta_key, 0.0)
     delta_used = custom_delta if use_custom_delta else standard_delta
 
-    # Анимация
     loading_msg = await message.answer("⏳ Конвертирую...")
 
-    # Расчёт
     if is_buy:
         result = amount / (rate + delta_used)
         result_without = amount / rate
@@ -651,7 +635,6 @@ async def handle_text(message: Message):
         await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
         return
 
-    # Формируем ответ
     result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
     if use_custom_delta:
         result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
