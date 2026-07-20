@@ -76,7 +76,8 @@ def get_user(telegram_id: int):
 
 def add_user(telegram_id: int, username: str = ""):
     try:
-        supabase.table("users").insert({"id": telegram_id, "username": username}).execute()
+        # Используем upsert – если запись с таким id уже есть, она обновится
+        supabase.table("users").upsert({"id": telegram_id, "username": username}).execute()
         return True
     except Exception as e:
         logger.error(f"add_user error: {e}")
@@ -534,16 +535,19 @@ async def handle_text(message: Message):
     if not get_user(user_id):
         stored_hash = get_password_hash()
         if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
-            # Пароль верный
-            add_user(user_id, message.from_user.username or "")
-            await message.answer(
-                f"✅ Доступ разрешён!\n\n{format_course_text()}",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-            if user_id in waiting_for:
-                del waiting_for[user_id]
-            return
+            # Пароль верный – пытаемся добавить пользователя
+            if add_user(user_id, message.from_user.username or ""):
+                await message.answer(
+                    f"✅ Доступ разрешён!\n\n{format_course_text()}",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard()
+                )
+                if user_id in waiting_for:
+                    del waiting_for[user_id]
+                return
+            else:
+                await message.answer("❌ Ошибка при сохранении пользователя. Попробуйте позже.")
+                return
         else:
             # Неверный пароль – даём подсказку
             await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
