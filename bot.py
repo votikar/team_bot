@@ -214,16 +214,12 @@ def get_cny_rub_rate(force=False):
         return None
 
 def get_usd_cny_rate(force=False):
-    # Если задан фиксированный курс – используем его
     if FIXED_USD_CNY is not None:
         return FIXED_USD_CNY
-
     now = datetime.now()
     if not force and _cache["timestamp"] and (now - _cache["timestamp"]).seconds < CACHE_TTL:
         if _cache["usd_cny"] is not None:
             return _cache["usd_cny"]
-
-    # Пробуем Frankfurter API (бесплатно, без ключа)
     try:
         url = "https://api.frankfurter.app/latest?from=USD&to=CNY"
         resp = requests.get(url, timeout=5)
@@ -236,8 +232,6 @@ def get_usd_cny_rate(force=False):
             return rate
     except Exception as e:
         logger.warning(f"Frankfurter USD/CNY failed: {e}")
-
-    # Резерв: exchangerate.host
     try:
         url = "https://api.exchangerate.host/convert?from=USD&to=CNY"
         resp = requests.get(url, timeout=5)
@@ -251,8 +245,6 @@ def get_usd_cny_rate(force=False):
                 return rate
     except Exception as e:
         logger.warning(f"exchangerate.host USD/CNY failed: {e}")
-
-    # Если ничего не получено, возвращаем None (без кросса через RUB)
     return None
 
 # ---------- Формирование текста курсов ----------
@@ -525,7 +517,7 @@ async def list_users_cmd(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста (включая пароль и конвертацию) ----------
+# ---------- Обработка текста ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -622,19 +614,42 @@ async def handle_text(message: Message):
 
     loading_msg = await message.answer("⏳ Конвертирую...")
 
+    # Расчёт результата
     if is_buy:
         result = amount / (rate + delta_used)
         result_without = amount / rate
         result_with = amount / (rate + standard_delta)
+        effective_rate = rate + delta_used
     else:
         result = amount * (rate - delta_used)
         result_without = amount * rate
         result_with = amount * (rate - standard_delta)
+        effective_rate = rate - delta_used
 
     if result is None:
         await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
         return
 
+    # --- Формируем сообщение с финальной ценой ---
+    # Определяем, что показывать как финальную цену
+    if from_cur == "RUB" and to_cur != "RUB":
+        # Конвертация из рублей в другую валюту: effective_rate = кол-во to_cur за 1 RUB
+        # Цена за 1 to_cur = 1 / effective_rate (рубли)
+        if effective_rate != 0:
+            price = 1 / effective_rate
+            price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {to_cur}"
+        else:
+            price_text = "💰 Цена для клиента: недоступна"
+    elif from_cur != "RUB" and to_cur == "RUB":
+        # Конвертация из другой валюты в рубли: effective_rate = рубли за 1 from_cur
+        price = effective_rate
+        price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {from_cur}"
+    else:
+        # Пары без RUB (USD/CNY и CNY/USD)
+        # effective_rate = кол-во to_cur за 1 from_cur
+        price_text = f"💰 1 {from_cur} = {effective_rate:.2f} {to_cur}"
+
+    # Строим результат
     result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
     if use_custom_delta:
         result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
@@ -649,6 +664,9 @@ async def handle_text(message: Message):
         profit_abs = result_without - result_with if is_buy else result_with - result_without
         profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
         result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
+
+    # Добавляем строку с финальной ценой
+    result_text += f"\n{price_text}"
 
     await loading_msg.edit_text(result_text, parse_mode="Markdown")
     await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
