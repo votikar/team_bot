@@ -630,23 +630,14 @@ async def handle_text(message: Message):
         await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
         return
 
-    # --- Формируем сообщение с финальной ценой ---
-    # Определяем, что показывать как финальную цену
-    if from_cur == "RUB" and to_cur != "RUB":
-        # Конвертация из рублей в другую валюту: effective_rate = кол-во to_cur за 1 RUB
-        # Цена за 1 to_cur = 1 / effective_rate (рубли)
-        if effective_rate != 0:
-            price = 1 / effective_rate
-            price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {to_cur}"
-        else:
-            price_text = "💰 Цена для клиента: недоступна"
-    elif from_cur != "RUB" and to_cur == "RUB":
-        # Конвертация из другой валюты в рубли: effective_rate = рубли за 1 from_cur
-        price = effective_rate
-        price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {from_cur}"
+    # --- Формируем финальную цену (исправленная логика) ---
+    if from_cur == "RUB" or to_cur == "RUB":
+        # Определяем не-RUB валюту
+        non_rub = to_cur if from_cur == "RUB" else from_cur
+        price = effective_rate  # это уже рубли за 1 non_rub
+        price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {non_rub}"
     else:
-        # Пары без RUB (USD/CNY и CNY/USD)
-        # effective_rate = кол-во to_cur за 1 from_cur
+        # Пары без RUB (USD/CNY, CNY/USD)
         price_text = f"💰 1 {from_cur} = {effective_rate:.2f} {to_cur}"
 
     # Строим результат
