@@ -44,15 +44,13 @@ _cache = {
 }
 CACHE_TTL = 30
 
-# ---------- Логирование ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Бот ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- Вспомогательные функции для Supabase ----------
+# ---------- Вспомогательные функции Supabase ----------
 def get_password_hash() -> str:
     try:
         resp = supabase.table("settings").select("value").eq("key", "access_password").execute()
@@ -247,7 +245,7 @@ def get_usd_cny_rate(force=False):
         logger.warning(f"exchangerate.host USD/CNY failed: {e}")
     return None
 
-# ---------- Формирование текста курсов ----------
+# ---------- Форматирование текста курсов ----------
 def format_course_text():
     usd_rub = get_usd_rub_rate()
     usdt_rub = get_usdt_rub_rate()
@@ -287,6 +285,7 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
         [InlineKeyboardButton(text="💱 Конвертировать", callback_data="convert")],
+        [InlineKeyboardButton(text="💰 Стоимость покупки", callback_data="need")],
         [InlineKeyboardButton(text="📘 Инструкция", callback_data="instruction")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
@@ -359,7 +358,7 @@ async def help_cmd(message: Message):
         "`1000000 1.50`"
     )
 
-# ---------- Команда /need ----------
+# ---------- Команда /need (текстовая) ----------
 @dp.message(Command("need"))
 async def need_cmd(message: Message):
     user_id = message.from_user.id
@@ -392,7 +391,6 @@ async def need_cmd(message: Message):
         await message.answer("❌ Доступные валюты: USDT, CNY")
         return
 
-    # Дельта (опционально)
     custom_delta = None
     if len(args) > 3:
         try:
@@ -401,12 +399,11 @@ async def need_cmd(message: Message):
             await message.answer("❌ Введите корректное число для дельты.")
             return
 
-    # Получаем курс и стандартную дельту
     if target_currency == "USDT":
         rate = get_usdt_rub_rate()
         standard_delta = get_today_deltas().get("usdt_rub", 0.0)
         currency_name = "USDT"
-    else:  # CNY
+    else:
         rate = get_cny_rub_rate()
         standard_delta = get_today_deltas().get("cny_rub", 0.0)
         currency_name = "CNY"
@@ -416,10 +413,9 @@ async def need_cmd(message: Message):
         return
 
     delta_used = custom_delta if custom_delta is not None else standard_delta
-    price_per_unit = rate + delta_used  # цена за 1 единицу целевой валюты в рублях
+    price_per_unit = rate + delta_used
     total_rub = amount * price_per_unit
 
-    # Формируем ответ
     if custom_delta is not None:
         delta_info = f" (вы указали {custom_delta:.2f}, стандартная {standard_delta:.2f})"
     else:
@@ -436,7 +432,125 @@ async def need_cmd(message: Message):
     )
     await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-# ---------- Админ-команды ----------
+# ---------- Кнопка "Стоимость покупки" (интерактивный диалог) ----------
+@dp.callback_query(F.data == "need")
+async def need_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if not get_user(user_id):
+        await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    # Спрашиваем валюту
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="USDT", callback_data="need_currency_USDT"),
+         InlineKeyboardButton(text="CNY", callback_data="need_currency_CNY")]
+    ])
+    await callback.message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("need_currency_"))
+async def need_currency_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    currency = callback.data.split("_")[2]  # USDT или CNY
+    # Сохраняем выбранную валюту в словарь ожидания
+    waiting_for[user_id] = {"step": "need_amount", "currency": currency}
+    await callback.message.edit_text(f"💱 Введите сумму в {currency} (число):")
+
+@dp.message(F.text.regexp(r'^\d+([,.]\d+)?$'))
+async def handle_need_amount(message: Message):
+    user_id = message.from_user.id
+    if user_id not in waiting_for:
+        return  # не в процессе need
+    state = waiting_for[user_id]
+    if state.get("step") != "need_amount":
+        return
+    try:
+        amount = float(message.text.replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Введите положительное число.")
+        return
+    # Сохраняем сумму, спрашиваем дельту
+    state["amount"] = amount
+    state["step"] = "need_delta"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустить (стандартная)", callback_data="need_delta_skip")]
+    ])
+    await message.answer(
+        f"💱 Введите дельту (или нажмите «Пропустить» для стандартной):\n"
+        f"Пример: 0.50",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "need_delta_skip")
+async def need_delta_skip_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if user_id not in waiting_for:
+        return
+    state = waiting_for[user_id]
+    if state.get("step") != "need_delta":
+        return
+    # Используем стандартную дельту
+    await finish_need_calculation(callback.message, user_id, state, custom_delta=None)
+    del waiting_for[user_id]
+
+@dp.message(F.text)
+async def handle_need_delta(message: Message):
+    user_id = message.from_user.id
+    if user_id not in waiting_for:
+        return
+    state = waiting_for[user_id]
+    if state.get("step") != "need_delta":
+        return
+    text = message.text.strip()
+    try:
+        custom_delta = float(text.replace(',', '.'))
+    except:
+        await message.answer("❌ Введите корректное число или нажмите «Пропустить».")
+        return
+    await finish_need_calculation(message, user_id, state, custom_delta=custom_delta)
+    del waiting_for[user_id]
+
+async def finish_need_calculation(message: Message, user_id: int, state: dict, custom_delta: float = None):
+    currency = state["currency"]
+    amount = state["amount"]
+
+    if currency == "USDT":
+        rate = get_usdt_rub_rate()
+        standard_delta = get_today_deltas().get("usdt_rub", 0.0)
+        currency_name = "USDT"
+    else:
+        rate = get_cny_rub_rate()
+        standard_delta = get_today_deltas().get("cny_rub", 0.0)
+        currency_name = "CNY"
+
+    if rate is None:
+        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
+        return
+
+    delta_used = custom_delta if custom_delta is not None else standard_delta
+    price_per_unit = rate + delta_used
+    total_rub = amount * price_per_unit
+
+    if custom_delta is not None:
+        delta_info = f" (вы указали {custom_delta:.2f}, стандартная {standard_delta:.2f})"
+    else:
+        delta_info = f" (стандартная {standard_delta:.2f})"
+
+    result_text = (
+        f"💱 **Стоимость покупки**\n\n"
+        f"Вы хотите получить: **{amount:,.2f} {currency_name}**\n"
+        f"Курс за 1 {currency_name}: **{rate:.2f}** ₽\n"
+        f"Дельта: **{delta_used:.2f}** ₽{delta_info}\n"
+        f"Цена за 1 {currency_name} с дельтой: **{price_per_unit:.2f}** ₽\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **Итого: {total_rub:,.2f} ₽**"
+    )
+    await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+# ---------- Админ-команды (не изменены) ----------
 @dp.message(Command("set_delta_USD_RUB"))
 async def set_delta_usd_rub(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -596,7 +710,7 @@ async def list_users_cmd(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста ----------
+# ---------- Обработка текста (конвертация и пр.) ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -629,10 +743,16 @@ async def handle_text(message: Message):
 
     # Проверяем, ожидаем ли мы ввод для конвертации
     if user_id not in waiting_for:
-        await message.answer("Сначала выберите направление конвертации через /convert.")
+        # Если не ждём ничего, возможно, это команда /need вручную, но она уже обработана выше
+        # Просто подсказываем
+        await message.answer("Сначала выберите действие через меню (обновить курс, конвертировать, стоимость покупки).")
         return
 
     conv_type = waiting_for.get(user_id)
+    if isinstance(conv_type, dict):
+        # Это состояние для need, обрабатывается отдельными хендлерами выше
+        return
+
     if not conv_type or not conv_type.startswith("conv_"):
         await message.answer("Сначала выберите направление конвертации через /convert.")
         return
@@ -693,7 +813,6 @@ async def handle_text(message: Message):
 
     loading_msg = await message.answer("⏳ Конвертирую...")
 
-    # Расчёт результата
     if is_buy:
         result = amount / (rate + delta_used)
         result_without = amount / rate
@@ -709,7 +828,6 @@ async def handle_text(message: Message):
         await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
         return
 
-    # --- Формируем финальную цену ---
     if from_cur == "RUB" or to_cur == "RUB":
         non_rub = to_cur if from_cur == "RUB" else from_cur
         price = effective_rate
@@ -717,7 +835,6 @@ async def handle_text(message: Message):
     else:
         price_text = f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**"
 
-    # Строим результат с выделением жирным
     result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
     if use_custom_delta:
         result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
@@ -790,7 +907,7 @@ async def instruction_cb(callback: CallbackQuery):
         "  Положительная дельта увеличивает курс.\n\n"
         "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
         "💰 **Цена для клиента** видна в результатах.\n\n"
-        "📌 Команда `/need` – рассчитать стоимость покупки фиксированной суммы."
+        "📌 Кнопка «Стоимость покупки» поможет быстро рассчитать, сколько рублей нужно для получения нужной суммы USDT или CNY."
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
