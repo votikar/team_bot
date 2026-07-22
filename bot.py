@@ -287,6 +287,7 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
         [InlineKeyboardButton(text="💱 Конвертировать", callback_data="convert")],
+        [InlineKeyboardButton(text="📘 Инструкция", callback_data="instruction")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
 
@@ -590,6 +591,27 @@ async def handle_text(message: Message):
     from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
     is_buy = from_cur == "RUB"
 
+    # --- Динамическая подсказка в зависимости от направления ---
+    if from_cur == "RUB" and to_cur != "RUB":
+        hint = (
+            f"💡 Положительная дельта увеличивает цену для клиента (наценка).\n"
+            f"Пример: 1000000 0.50"
+        )
+    elif from_cur != "RUB" and to_cur == "RUB":
+        hint = (
+            f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\n"
+            f"Пример: 13000 -0.50"
+        )
+    else:
+        hint = (
+            f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\n"
+            f"Пример: 1000 0.10"
+        )
+
+    # Отправляем подсказку перед запросом суммы, но мы уже ввели сумму, поэтому меняем логику: подсказка уже в меню?
+    # Мы будем отправлять подсказку при выборе направления, а не здесь. Поэтому этот блок перенесём в conv_choice_cb.
+    # А здесь оставим только обработку.
+
     # Получаем курс и дельту
     if from_cur == "USD" or to_cur == "USD":
         rate = get_usd_rub_rate()
@@ -630,33 +652,31 @@ async def handle_text(message: Message):
         await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
         return
 
-    # --- Формируем финальную цену (исправленная логика) ---
+    # --- Формируем финальную цену ---
     if from_cur == "RUB" or to_cur == "RUB":
-        # Определяем не-RUB валюту
         non_rub = to_cur if from_cur == "RUB" else from_cur
-        price = effective_rate  # это уже рубли за 1 non_rub
-        price_text = f"💰 Цена для клиента: {price:.2f} RUB за 1 {non_rub}"
+        price = effective_rate
+        price_text = f"💰 **Цена для клиента: {price:.2f} RUB за 1 {non_rub}**"
     else:
-        # Пары без RUB (USD/CNY, CNY/USD)
-        price_text = f"💰 1 {from_cur} = {effective_rate:.2f} {to_cur}"
+        price_text = f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**"
 
-    # Строим результат
+    # Строим результат с выделением жирным
     result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
     if use_custom_delta:
         result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
-        result_text += f"🔸 **С вашей дельтой ({delta_used:.2f}):** {result:.4f} {to_cur}\n"
+        result_text += f"🔸 **С вашей дельтой ({delta_used:.2f}):** **{result:.4f} {to_cur}**\n"
         result_text += f"📌 Стандартная дельта на сегодня: {standard_delta:.2f}\n"
         profit_abs = result_without - result if is_buy else result - result_without
         profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
         result_text += f"💰 Прибыль от вашей дельты: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
     else:
         result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
-        result_text += f"🔸 **С дельтой ({standard_delta:.2f}):** {result_with:.4f} {to_cur}\n"
+        result_text += f"🔸 **С дельтой ({standard_delta:.2f}):** **{result_with:.4f} {to_cur}**\n"
         profit_abs = result_without - result_with if is_buy else result_with - result_without
         profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
         result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
 
-    # Добавляем строку с финальной ценой
+    # Добавляем строку с финальной ценой (жирным)
     result_text += f"\n{price_text}"
 
     await loading_msg.edit_text(result_text, parse_mode="Markdown")
@@ -699,6 +719,24 @@ async def convert_cb(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
 
+@dp.callback_query(F.data == "instruction")
+async def instruction_cb(callback: CallbackQuery):
+    await callback.answer()
+    text = (
+        "📘 **Краткая инструкция по дельте:**\n\n"
+        "• **RUB → USDT / CNY / USD**\n"
+        "  Положительная дельта = наценка (выше курс)\n"
+        "  Пример: `1000000 0.50`\n\n"
+        "• **USDT / CNY / USD → RUB**\n"
+        "  Отрицательная дельта = наценка (выше курс)\n"
+        "  Пример: `13000 -0.50`\n\n"
+        "• **USD → CNY** и **CNY → USD**\n"
+        "  Положительная дельта увеличивает курс.\n\n"
+        "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
+        "💰 **Цена для клиента** выделена жирным и видна в результатах."
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
 @dp.callback_query(F.data.startswith("conv_"))
 async def conv_choice_cb(callback: CallbackQuery):
     await callback.answer()
@@ -709,10 +747,29 @@ async def conv_choice_cb(callback: CallbackQuery):
     from_cur, to_cur = pair
     conv_key = f"conv_{from_cur}_{to_cur}"
     waiting_for[callback.from_user.id] = conv_key
+
+    # Динамическая подсказка в зависимости от направления
+    if from_cur == "RUB" and to_cur != "RUB":
+        hint = (
+            f"💡 Положительная дельта увеличивает цену для клиента (наценка).\n"
+            f"Пример: 1000000 0.50"
+        )
+    elif from_cur != "RUB" and to_cur == "RUB":
+        hint = (
+            f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\n"
+            f"Пример: 13000 -0.50"
+        )
+    else:
+        hint = (
+            f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\n"
+            f"Пример: 1000 0.10"
+        )
+
     await callback.message.answer(
         f"💱 Введите сумму в {from_cur}:\n"
-        "Можно указать дельту через пробел, например:\n"
-        "`1000000 1.50`"
+        f"Можно указать дельту через пробел.\n"
+        f"{hint}",
+        parse_mode="Markdown"
     )
 
 # ---------- Запуск ----------
