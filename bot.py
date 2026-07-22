@@ -352,11 +352,89 @@ async def help_cmd(message: Message):
         "/start – Главное меню\n"
         "/course – Показать курсы и дельты\n"
         "/convert – Открыть меню конвертации\n"
+        "/need – Рассчитать стоимость покупки\n"
         "/help – Эта справка\n\n"
         "💡 При конвертации можно указать индивидуальную дельту:\n"
         "Введите сумму и дельту через пробел, например:\n"
         "`1000000 1.50`"
     )
+
+# ---------- Команда /need ----------
+@dp.message(Command("need"))
+async def need_cmd(message: Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer(
+            "❌ Формат: `/need <сумма> <валюта> [дельта]`\n"
+            "Примеры:\n"
+            "`/need 30000 USDT` – стоимость 30 000 USDT (стандартная дельта)\n"
+            "`/need 30000 USDT 0.50` – стоимость 30 000 USDT с дельтой 0.50\n"
+            "`/need 50000 CNY` – стоимость 50 000 CNY\n\n"
+            "Доступные валюты: USDT, CNY",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        amount = float(args[1].replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Введите корректное положительное число.")
+        return
+
+    target_currency = args[2].upper()
+    if target_currency not in ("USDT", "CNY"):
+        await message.answer("❌ Доступные валюты: USDT, CNY")
+        return
+
+    # Дельта (опционально)
+    custom_delta = None
+    if len(args) > 3:
+        try:
+            custom_delta = float(args[3].replace(',', '.'))
+        except:
+            await message.answer("❌ Введите корректное число для дельты.")
+            return
+
+    # Получаем курс и стандартную дельту
+    if target_currency == "USDT":
+        rate = get_usdt_rub_rate()
+        standard_delta = get_today_deltas().get("usdt_rub", 0.0)
+        currency_name = "USDT"
+    else:  # CNY
+        rate = get_cny_rub_rate()
+        standard_delta = get_today_deltas().get("cny_rub", 0.0)
+        currency_name = "CNY"
+
+    if rate is None:
+        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
+        return
+
+    delta_used = custom_delta if custom_delta is not None else standard_delta
+    price_per_unit = rate + delta_used  # цена за 1 единицу целевой валюты в рублях
+    total_rub = amount * price_per_unit
+
+    # Формируем ответ
+    if custom_delta is not None:
+        delta_info = f" (вы указали {custom_delta:.2f}, стандартная {standard_delta:.2f})"
+    else:
+        delta_info = f" (стандартная {standard_delta:.2f})"
+
+    result_text = (
+        f"💱 **Стоимость покупки**\n\n"
+        f"Вы хотите получить: **{amount:,.2f} {currency_name}**\n"
+        f"Курс за 1 {currency_name}: **{rate:.2f}** ₽\n"
+        f"Дельта: **{delta_used:.2f}** ₽{delta_info}\n"
+        f"Цена за 1 {currency_name} с дельтой: **{price_per_unit:.2f}** ₽\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **Итого: {total_rub:,.2f} ₽**"
+    )
+    await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 # ---------- Админ-команды ----------
 @dp.message(Command("set_delta_USD_RUB"))
@@ -655,7 +733,6 @@ async def handle_text(message: Message):
         profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
         result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
 
-    # Добавляем строку с финальной ценой (жирным)
     result_text += f"\n{price_text}"
 
     await loading_msg.edit_text(result_text, parse_mode="Markdown")
@@ -712,7 +789,8 @@ async def instruction_cb(callback: CallbackQuery):
         "• **USD → CNY** и **CNY → USD**\n"
         "  Положительная дельта увеличивает курс.\n\n"
         "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
-        "💰 **Цена для клиента** видна в результатах."
+        "💰 **Цена для клиента** видна в результатах.\n\n"
+        "📌 Команда `/need` – рассчитать стоимость покупки фиксированной суммы."
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
@@ -727,22 +805,12 @@ async def conv_choice_cb(callback: CallbackQuery):
     conv_key = f"conv_{from_cur}_{to_cur}"
     waiting_for[callback.from_user.id] = conv_key
 
-    # Динамическая подсказка в зависимости от направления
     if from_cur == "RUB" and to_cur != "RUB":
-        hint = (
-            f"💡 Положительная дельта увеличивает цену для клиента (наценка).\n"
-            f"Пример: 1000000 0.50"
-        )
+        hint = f"💡 Положительная дельта увеличивает цену для клиента (наценка).\nПример: 1000000 0.50"
     elif from_cur != "RUB" and to_cur == "RUB":
-        hint = (
-            f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\n"
-            f"Пример: 13000 -0.50"
-        )
+        hint = f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\nПример: 13000 -0.50"
     else:
-        hint = (
-            f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\n"
-            f"Пример: 1000 0.10"
-        )
+        hint = f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\nПример: 1000 0.10"
 
     await callback.message.answer(
         f"💱 Введите сумму в {from_cur}:\n"
@@ -757,6 +825,7 @@ async def main():
         BotCommand(command="start", description="🏦 Главное меню"),
         BotCommand(command="course", description="💰 Курсы и дельты"),
         BotCommand(command="convert", description="💱 Конвертация валют"),
+        BotCommand(command="need", description="💰 Стоимость покупки"),
         BotCommand(command="help", description="❓ Помощь")
     ])
     await dp.start_polling(bot, skip_updates=True)
