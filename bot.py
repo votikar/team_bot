@@ -381,6 +381,8 @@ def main_menu_keyboard():
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
         [InlineKeyboardButton(text="💱 Конвертировать", callback_data="convert")],
         [InlineKeyboardButton(text="💰 Стоимость покупки", callback_data="need")],
+        [InlineKeyboardButton(text="🛡️ Проверить кошелёк", callback_data="aml_check")],
+        [InlineKeyboardButton(text="📋 Мои проверки", callback_data="my_checks")],
         [InlineKeyboardButton(text="📘 Инструкция", callback_data="instruction")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
@@ -403,6 +405,31 @@ def need_currency_keyboard():
         [InlineKeyboardButton(text="USDT", callback_data="need_currency_USDT"),
          InlineKeyboardButton(text="CNY", callback_data="need_currency_CNY")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_course")]
+    ])
+
+def my_checks_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 История проверок", callback_data="check_history")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="check_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_course")]
+    ])
+
+def after_aml_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить другой", callback_data="aml_check")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_course")]
+    ])
+
+def network_choice_keyboard(address: str):
+    # Клавиатура для ручного выбора сети, если автоопределение не сработало
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="BTC", callback_data=f"aml_network_BTC_{address}"),
+         InlineKeyboardButton(text="ETH", callback_data=f"aml_network_ETH_{address}")],
+        [InlineKeyboardButton(text="USDT (ERC-20)", callback_data=f"aml_network_USDT_ERC20_{address}"),
+         InlineKeyboardButton(text="USDT (TRC-20)", callback_data=f"aml_network_USDT_TRC20_{address}")],
+        [InlineKeyboardButton(text="TRX", callback_data=f"aml_network_TRX_{address}"),
+         InlineKeyboardButton(text="BNB", callback_data=f"aml_network_BNB_{address}")],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_course")]
     ])
 
 # ---------- AML-провайдеры ----------
@@ -448,9 +475,21 @@ class GetBlockProvider(AMLProvider):
         if not self.api_key:
             return None
         try:
+            # Маппинг сетей для GetBlock
+            network_map = {
+                "BTC": "BTC",
+                "ETH": "ETH",
+                "USDT_ERC20": "ETH",
+                "USDT_TRC20": "TRX",
+                "TRX": "TRX",
+                "BNB": "BNB",
+                "LTC": "LTC",
+                "BCH": "BCH"
+            }
+            net = network_map.get(network, "ETH") if network else "ETH"
             url = "https://api.getblock.io/v1/aml/check"
             headers = {"Content-Type": "application/json", "x-api-key": self.api_key}
-            payload = {"address": address, "network": network or "ETH"}
+            payload = {"address": address, "network": net}
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -504,7 +543,7 @@ def log_aml_check(user_id: int, address: str, result: dict):
 
 def format_aml_report(address: str, result: dict) -> str:
     lines = [
-        "🛡️ **AML-проверка кошелька**",
+        "🛡️ **Проверка кошелька**",
         "━━━━━━━━━━━━━━━━━━━",
         f"📌 Адрес: `{address}`",
         f"🔗 Сеть: {result.get('network', 'Неизвестно')}",
@@ -518,6 +557,8 @@ def format_aml_report(address: str, result: dict) -> str:
         lines.append(f"📎 **Обнаруженные риски:** {details_text}")
     else:
         lines.append("📎 **Обнаруженные риски:** не найдено")
+    # Дополнительные поля, если есть
+    # Связанные адреса, баланс, последняя активность – если API даёт, можно добавить
     lines.append(f"📡 **Источник:** {result.get('source', 'Неизвестно')}")
     lines.append(f"🕒 **Проверка выполнена:** {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     return "\n".join(lines)
@@ -590,43 +631,47 @@ async def help_cmd(message: Message):
         "`1000000 1.50`"
     )
 
-# ---------- AML-команды ----------
-@dp.message(Command("check_wallet"))
-async def check_wallet_cmd(message: Message):
-    user_id = message.from_user.id
+# ---------- Обработчики AML через инлайн-меню ----------
+@dp.callback_query(F.data == "aml_check")
+async def aml_check_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
     if not get_user(user_id):
-        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ Укажите адрес кошелька.\nПример: `/check_wallet 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`", parse_mode="Markdown")
-        return
-    address = args[1].strip()
-    if not re.match(r'^[0-9a-zA-Z]{20,60}$', address):
-        await message.answer("❌ Некорректный формат адреса. Проверьте и попробуйте снова.")
-        return
+    # Очищаем предыдущее состояние
+    if user_id in waiting_for:
+        del waiting_for[user_id]
+    await callback.message.answer(
+        "🛡️ Введите адрес кошелька для проверки.\n\n"
+        "Поддерживаются: BTC, ETH, USDT (ERC-20/TRC-20), TRX, BNB, LTC, BCH.\n"
+        "Сеть будет определена автоматически. Если не удастся – предложу выбрать вручную.\n\n"
+        "Пример: `0x742d35Cc6634C0532925a3b844Bc454e4438f44e`",
+        parse_mode="Markdown"
+    )
+    waiting_for[user_id] = {"step": "aml_waiting_address"}
 
-    await message.answer("⏳ Проверяю кошелёк...")
-    result = await aml_check(address)
-    if result is None:
-        await message.answer("❌ Не удалось выполнить проверку. Попробуйте позже или обратитесь к администратору.")
-        return
-
-    log_aml_check(user_id, address, result)
-    report = format_aml_report(address, result)
-    await message.answer(report, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-@dp.message(Command("check_history"))
-async def check_history_cmd(message: Message):
-    user_id = message.from_user.id
+@dp.callback_query(F.data == "my_checks")
+async def my_checks_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
     if not get_user(user_id):
-        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    await callback.message.answer("📋 Выберите, что хотите посмотреть:", reply_markup=my_checks_keyboard())
+
+@dp.callback_query(F.data == "check_history")
+async def check_history_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if not get_user(user_id):
+        await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
     try:
         resp = supabase.table("aml_checks").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
         rows = resp.data
         if not rows:
-            await message.answer("📭 У вас пока нет проверок.")
+            await callback.message.answer("📭 У вас пока нет проверок.", reply_markup=main_menu_keyboard())
             return
         text = "📋 **История проверок**\n\n"
         for row in rows:
@@ -634,23 +679,24 @@ async def check_history_cmd(message: Message):
             text += f"📌 `{row['wallet_address']}`\n"
             text += f"📊 Риск: {row['risk_score']}/100 ({row['risk_level']})\n"
             text += f"📡 {row.get('source', 'Unknown')}\n\n"
-        await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     except Exception as e:
         logger.error(f"check_history error: {e}")
-        await message.answer("❌ Ошибка при получении истории.")
+        await callback.message.answer("❌ Ошибка при получении истории.", reply_markup=main_menu_keyboard())
 
-@dp.message(Command("check_stats"))
-async def check_stats_cmd(message: Message):
-    user_id = message.from_user.id
+@dp.callback_query(F.data == "check_stats")
+async def check_stats_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
     if not get_user(user_id):
-        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
     try:
         resp = supabase.table("aml_checks").select("*").execute()
         all_rows = resp.data
         total = len(all_rows)
         if total == 0:
-            await message.answer("📊 Статистика пока пуста.")
+            await callback.message.answer("📊 Статистика пока пуста.", reply_markup=main_menu_keyboard())
             return
         high_risk = sum(1 for r in all_rows if r.get("risk_score", 0) >= 60)
         medium_risk = sum(1 for r in all_rows if 30 <= r.get("risk_score", 0) < 60)
@@ -663,110 +709,36 @@ async def check_stats_cmd(message: Message):
             f"🟡 Средний риск: {medium_risk}\n"
             f"🔴 Высокий риск: {high_risk}\n"
         )
-        await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     except Exception as e:
         logger.error(f"check_stats error: {e}")
-        await message.answer("❌ Ошибка при получении статистики.")
+        await callback.message.answer("❌ Ошибка при получении статистики.", reply_markup=main_menu_keyboard())
 
-# ---------- Обработка конвертации и стоимости покупки ----------
-@dp.callback_query(F.data == "refresh")
-async def refresh_cb(callback: CallbackQuery):
-    await callback.answer("Обновляю...")
-    get_usd_rub_rate(force=True)
-    get_usdt_rub_rate(force=True)
-    get_cny_rub_rate(force=True)
-    get_usd_cny_rate(force=True)
-    get_usdt_cny_rate(force=True)
-    await callback.message.answer(
-        format_course_text(),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "back_to_course")
-async def back_cb(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("aml_network_"))
+async def aml_network_callback(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(
-        format_course_text(),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "main_menu")
-async def main_menu_cb(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        f"🏦 Главное меню\n\n{format_course_text()}",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "convert")
-async def convert_cb(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
-
-@dp.callback_query(F.data == "instruction")
-async def instruction_cb(callback: CallbackQuery):
-    await callback.answer()
-    text = (
-        "📘 **Краткая инструкция по дельте:**\n\n"
-        "• **RUB → USDT / CNY / USD**\n"
-        "  Положительная дельта = наценка (выше курс)\n"
-        "  Пример: `1000000 0.50`\n\n"
-        "• **USDT / CNY / USD → RUB**\n"
-        "  Отрицательная дельта = наценка (выше курс)\n"
-        "  Пример: `13000 -0.50`\n\n"
-        "• **USD → CNY** и **CNY → USD**\n"
-        "  Положительная дельта увеличивает курс.\n\n"
-        "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
-        "💰 **Цена для клиента** видна в результатах.\n\n"
-        "📌 Кнопка «Стоимость покупки» поможет быстро рассчитать, сколько рублей нужно для получения нужной суммы USDT или CNY."
-    )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-@dp.callback_query(F.data.startswith("conv_"))
-async def conv_choice_cb(callback: CallbackQuery):
-    await callback.answer()
-    pair = callback.data.split("_")[1:]
-    if len(pair) != 2:
-        await callback.message.answer("Ошибка.")
+    user_id = callback.from_user.id
+    data_parts = callback.data.split("_")
+    if len(data_parts) < 4:
+        await callback.message.answer("Ошибка выбора сети.")
         return
-    from_cur, to_cur = pair
-    conv_key = f"conv_{from_cur}_{to_cur}"
-    waiting_for[callback.from_user.id] = conv_key
+    network = data_parts[2]
+    address = "_".join(data_parts[3:])  # адрес может содержать подчёркивания
+    # Выполняем проверку с выбранной сетью
+    await perform_aml_check(callback.message, user_id, address, network)
 
-    if from_cur == "RUB" and to_cur != "RUB":
-        hint = f"💡 Положительная дельта увеличивает цену для клиента (наценка).\nПример: 1000000 0.50"
-    elif from_cur != "RUB" and to_cur == "RUB":
-        hint = f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\nПример: 13000 -0.50"
-    else:
-        hint = f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\nПример: 1000 0.10"
+async def perform_aml_check(message: Message, user_id: int, address: str, network: str = None):
+    # Отправляем сообщение о начале проверки
+    loading_msg = await message.answer("⏳ Проверяю кошелёк...")
+    result = await aml_check(address, network)
+    if result is None:
+        await loading_msg.edit_text("❌ Не удалось выполнить проверку. Попробуйте позже или обратитесь к администратору.", reply_markup=main_menu_keyboard())
+        return
+    log_aml_check(user_id, address, result)
+    report = format_aml_report(address, result)
+    await loading_msg.edit_text(report, parse_mode="Markdown", reply_markup=after_aml_keyboard())
 
-    await callback.message.answer(
-        f"💱 Введите сумму в {from_cur}:\n"
-        f"Можно указать дельту через пробел.\n"
-        f"{hint}",
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "need")
-async def need_callback(callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    if user_id in waiting_for:
-        del waiting_for[user_id]
-    await callback.message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=need_currency_keyboard())
-
-@dp.callback_query(F.data.startswith("need_currency_"))
-async def need_currency_callback(callback: CallbackQuery):
-    await callback.answer()
-    currency = callback.data.split("_")[2]  # USDT или CNY
-    user_id = callback.from_user.id
-    waiting_for[user_id] = {"step": "need_amount", "currency": currency}
-    await callback.message.edit_text(f"💱 Введите сумму в {currency} (только число):")
-
-# ---------- Обработка текстовых сообщений ----------
+# ---------- Обработка текстовых сообщений для AML и других функций ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -797,24 +769,63 @@ async def handle_text(message: Message):
     if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
         del waiting_for[user_id]
 
-    # ---- 3. Проверяем, ожидаем ли мы ввод ----
+    # ---- 3. Проверяем, ожидаем ли мы ввод адреса для AML ----
+    if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_waiting_address":
+        # Пытаемся определить сеть автоматически
+        network = None
+        address = text
+        # Простейшее автоопределение по формату
+        if re.match(r'^0x[a-fA-F0-9]{40}$', address):
+            network = "ETH"
+        elif re.match(r'^1[a-km-zA-HJ-NP-Z0-9]{25,34}$', address):
+            network = "BTC"
+        elif re.match(r'^T[a-zA-Z0-9]{33}$', address):
+            network = "TRX"
+        elif re.match(r'^bnb[a-zA-Z0-9]{39}$', address):
+            network = "BNB"
+        elif re.match(r'^M[a-zA-Z0-9]{34}$', address):
+            network = "LTC"
+        elif re.match(r'^q[a-zA-Z0-9]{41}$', address):
+            network = "BCH"
+        # USDT – сложно определить по адресу, оставляем как есть, предложим выбор
+        if network:
+            # Сразу проверяем
+            del waiting_for[user_id]
+            await perform_aml_check(message, user_id, address, network)
+            return
+        else:
+            # Не удалось определить сеть – предлагаем выбрать вручную
+            await message.answer(
+                "🔍 Не удалось автоматически определить сеть для этого адреса.\n"
+                "Пожалуйста, выберите сеть вручную:",
+                reply_markup=network_choice_keyboard(address)
+            )
+            # Сохраняем адрес в состоянии
+            waiting_for[user_id] = {"step": "aml_network_choice", "address": address}
+            return
+
+    # ---- 4. Если ожидаем выбор сети (после ручного выбора) ----
+    if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_network_choice":
+        # Это обрабатывается через коллбэки `aml_network_*`, поэтому сюда не попадём
+        pass
+
+    # ---- 5. Обработка стоимости покупки (словарь) ----
+    if user_id in waiting_for and isinstance(waiting_for[user_id], dict):
+        if waiting_for[user_id].get("step") == "need_amount" and "currency" in waiting_for[user_id]:
+            await handle_need_input(message, waiting_for[user_id])
+            return
+        else:
+            # Если словарь, но не для need – очищаем
+            del waiting_for[user_id]
+            await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
+            return
+
+    # ---- 6. Обработка обычной конвертации (строка) ----
     if user_id not in waiting_for:
         await message.answer("Сначала выберите действие через меню.")
         return
 
     conv_type = waiting_for.get(user_id)
-
-    # ---- 4. Обработка стоимости покупки (словарь) ----
-    if isinstance(conv_type, dict):
-        if conv_type.get("step") == "need_amount" and "currency" in conv_type:
-            await handle_need_input(message, conv_type)
-            return
-        else:
-            del waiting_for[user_id]
-            await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
-            return
-
-    # ---- 5. Обработка обычной конвертации (строка) ----
     if not isinstance(conv_type, str) or not conv_type.startswith("conv_"):
         await message.answer("Сначала выберите направление конвертации через /convert.")
         return
@@ -936,6 +947,105 @@ async def handle_need_input(message: Message, state: dict):
         f"💰 **Итого: {total_rub:,.2f} ₽**"
     )
     await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+# ---------- Остальные коллбэки (конвертация, стоимость покупки и т.д.) ----------
+@dp.callback_query(F.data == "refresh")
+async def refresh_cb(callback: CallbackQuery):
+    await callback.answer("Обновляю...")
+    get_usd_rub_rate(force=True)
+    get_usdt_rub_rate(force=True)
+    get_cny_rub_rate(force=True)
+    get_usd_cny_rate(force=True)
+    get_usdt_cny_rate(force=True)
+    await callback.message.answer(
+        format_course_text(),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "back_to_course")
+async def back_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        format_course_text(),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        f"🏦 Главное меню\n\n{format_course_text()}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "convert")
+async def convert_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
+
+@dp.callback_query(F.data == "instruction")
+async def instruction_cb(callback: CallbackQuery):
+    await callback.answer()
+    text = (
+        "📘 **Краткая инструкция по дельте:**\n\n"
+        "• **RUB → USDT / CNY / USD**\n"
+        "  Положительная дельта = наценка (выше курс)\n"
+        "  Пример: `1000000 0.50`\n\n"
+        "• **USDT / CNY / USD → RUB**\n"
+        "  Отрицательная дельта = наценка (выше курс)\n"
+        "  Пример: `13000 -0.50`\n\n"
+        "• **USD → CNY** и **CNY → USD**\n"
+        "  Положительная дельта увеличивает курс.\n\n"
+        "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
+        "💰 **Цена для клиента** видна в результатах.\n\n"
+        "📌 Кнопка «Стоимость покупки» поможет быстро рассчитать, сколько рублей нужно для получения нужной суммы USDT или CNY.\n\n"
+        "🛡️ **AML-проверка кошелька** – введите адрес, бот проверит его на чистоту."
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+@dp.callback_query(F.data.startswith("conv_"))
+async def conv_choice_cb(callback: CallbackQuery):
+    await callback.answer()
+    pair = callback.data.split("_")[1:]
+    if len(pair) != 2:
+        await callback.message.answer("Ошибка.")
+        return
+    from_cur, to_cur = pair
+    conv_key = f"conv_{from_cur}_{to_cur}"
+    waiting_for[callback.from_user.id] = conv_key
+
+    if from_cur == "RUB" and to_cur != "RUB":
+        hint = f"💡 Положительная дельта увеличивает цену для клиента (наценка).\nПример: 1000000 0.50"
+    elif from_cur != "RUB" and to_cur == "RUB":
+        hint = f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\nПример: 13000 -0.50"
+    else:
+        hint = f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\nПример: 1000 0.10"
+
+    await callback.message.answer(
+        f"💱 Введите сумму в {from_cur}:\n"
+        f"Можно указать дельту через пробел.\n"
+        f"{hint}",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "need")
+async def need_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if user_id in waiting_for:
+        del waiting_for[user_id]
+    await callback.message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=need_currency_keyboard())
+
+@dp.callback_query(F.data.startswith("need_currency_"))
+async def need_currency_callback(callback: CallbackQuery):
+    await callback.answer()
+    currency = callback.data.split("_")[2]  # USDT или CNY
+    user_id = callback.from_user.id
+    waiting_for[user_id] = {"step": "need_amount", "currency": currency}
+    await callback.message.edit_text(f"💱 Введите сумму в {currency} (только число):")
 
 # ---------- Админ-команды ----------
 @dp.message(Command("set_delta_USD_RUB"))
