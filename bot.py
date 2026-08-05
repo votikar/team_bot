@@ -421,7 +421,6 @@ def after_aml_keyboard():
     ])
 
 def network_choice_keyboard(address: str):
-    # Клавиатура для ручного выбора сети, если автоопределение не сработало
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="BTC", callback_data=f"aml_network_BTC_{address}"),
          InlineKeyboardButton(text="ETH", callback_data=f"aml_network_ETH_{address}")],
@@ -463,6 +462,8 @@ class USDTBanListProvider(AMLProvider):
                     "details": details,
                     "network": network or "TRON/ETH"
                 }
+            else:
+                logger.warning(f"USDTBanList returned status {resp.status_code}")
         except Exception as e:
             logger.warning(f"USDTBanList exception: {e}")
         return None
@@ -475,7 +476,6 @@ class GetBlockProvider(AMLProvider):
         if not self.api_key:
             return None
         try:
-            # Маппинг сетей для GetBlock
             network_map = {
                 "BTC": "BTC",
                 "ETH": "ETH",
@@ -507,22 +507,43 @@ class GetBlockProvider(AMLProvider):
                     "details": details,
                     "network": network or "ETH"
                 }
+            else:
+                logger.warning(f"GetBlock returned status {resp.status_code}")
         except Exception as e:
             logger.warning(f"GetBlock exception: {e}")
         return None
 
+class FallbackProvider(AMLProvider):
+    name = "Fallback (тестовый)"
+    def check(self, address: str, network: str = None) -> dict:
+        return {
+            "source": self.name,
+            "risk_score": 5,
+            "risk_level": "Низкий",
+            "status": "✅ Чистый (тест)",
+            "details": ["Тестовая проверка – все API недоступны"],
+            "network": network or "Неизвестно"
+        }
+
 aml_providers = [USDTBanListProvider()]
 if GETBLOCK_API_KEY:
     aml_providers.append(GetBlockProvider(GETBLOCK_API_KEY))
+aml_providers.append(FallbackProvider())
 
 async def aml_check(address: str, network: str = None) -> dict:
     for provider in aml_providers:
         try:
+            logger.info(f"Trying provider: {provider.name} for address {address[:10]}...")
             result = provider.check(address, network)
             if result:
+                logger.info(f"Provider {provider.name} returned result: risk_score={result.get('risk_score')}")
                 return result
-        except:
+            else:
+                logger.warning(f"Provider {provider.name} returned None")
+        except Exception as e:
+            logger.error(f"Provider {provider.name} error: {e}")
             continue
+    logger.error("All providers failed")
     return None
 
 def log_aml_check(user_id: int, address: str, result: dict):
@@ -557,8 +578,6 @@ def format_aml_report(address: str, result: dict) -> str:
         lines.append(f"📎 **Обнаруженные риски:** {details_text}")
     else:
         lines.append("📎 **Обнаруженные риски:** не найдено")
-    # Дополнительные поля, если есть
-    # Связанные адреса, баланс, последняя активность – если API даёт, можно добавить
     lines.append(f"📡 **Источник:** {result.get('source', 'Неизвестно')}")
     lines.append(f"🕒 **Проверка выполнена:** {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     return "\n".join(lines)
@@ -639,7 +658,6 @@ async def aml_check_callback(callback: CallbackQuery):
     if not get_user(user_id):
         await callback.message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
-    # Очищаем предыдущее состояние
     if user_id in waiting_for:
         del waiting_for[user_id]
     await callback.message.answer(
@@ -723,12 +741,10 @@ async def aml_network_callback(callback: CallbackQuery):
         await callback.message.answer("Ошибка выбора сети.")
         return
     network = data_parts[2]
-    address = "_".join(data_parts[3:])  # адрес может содержать подчёркивания
-    # Выполняем проверку с выбранной сетью
+    address = "_".join(data_parts[3:])
     await perform_aml_check(callback.message, user_id, address, network)
 
 async def perform_aml_check(message: Message, user_id: int, address: str, network: str = None):
-    # Отправляем сообщение о начале проверки
     loading_msg = await message.answer("⏳ Проверяю кошелёк...")
     result = await aml_check(address, network)
     if result is None:
@@ -738,7 +754,7 @@ async def perform_aml_check(message: Message, user_id: int, address: str, networ
     report = format_aml_report(address, result)
     await loading_msg.edit_text(report, parse_mode="Markdown", reply_markup=after_aml_keyboard())
 
-# ---------- Обработка текстовых сообщений для AML и других функций ----------
+# ---------- Обработка текстовых сообщений ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -771,10 +787,9 @@ async def handle_text(message: Message):
 
     # ---- 3. Проверяем, ожидаем ли мы ввод адреса для AML ----
     if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_waiting_address":
+        address = text
         # Пытаемся определить сеть автоматически
         network = None
-        address = text
-        # Простейшее автоопределение по формату
         if re.match(r'^0x[a-fA-F0-9]{40}$', address):
             network = "ETH"
         elif re.match(r'^1[a-km-zA-HJ-NP-Z0-9]{25,34}$', address):
@@ -787,9 +802,7 @@ async def handle_text(message: Message):
             network = "LTC"
         elif re.match(r'^q[a-zA-Z0-9]{41}$', address):
             network = "BCH"
-        # USDT – сложно определить по адресу, оставляем как есть, предложим выбор
         if network:
-            # Сразу проверяем
             del waiting_for[user_id]
             await perform_aml_check(message, user_id, address, network)
             return
@@ -800,13 +813,12 @@ async def handle_text(message: Message):
                 "Пожалуйста, выберите сеть вручную:",
                 reply_markup=network_choice_keyboard(address)
             )
-            # Сохраняем адрес в состоянии
             waiting_for[user_id] = {"step": "aml_network_choice", "address": address}
             return
 
-    # ---- 4. Если ожидаем выбор сети (после ручного выбора) ----
+    # ---- 4. Если ожидаем выбор сети (обрабатывается через коллбэк) ----
     if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_network_choice":
-        # Это обрабатывается через коллбэки `aml_network_*`, поэтому сюда не попадём
+        # Это обрабатывается через коллбэки `aml_network_*`
         pass
 
     # ---- 5. Обработка стоимости покупки (словарь) ----
@@ -815,7 +827,6 @@ async def handle_text(message: Message):
             await handle_need_input(message, waiting_for[user_id])
             return
         else:
-            # Если словарь, но не для need – очищаем
             del waiting_for[user_id]
             await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
             return
@@ -902,7 +913,6 @@ async def handle_text(message: Message):
     await loading_msg.edit_text(result_text, parse_mode="Markdown")
     await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
 
-# ---------- Обработка ввода для стоимости покупки ----------
 async def handle_need_input(message: Message, state: dict):
     user_id = message.from_user.id
     currency = state.get("currency")
@@ -948,7 +958,7 @@ async def handle_need_input(message: Message, state: dict):
     )
     await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
-# ---------- Остальные коллбэки (конвертация, стоимость покупки и т.д.) ----------
+# ---------- Остальные коллбэки ----------
 @dp.callback_query(F.data == "refresh")
 async def refresh_cb(callback: CallbackQuery):
     await callback.answer("Обновляю...")
