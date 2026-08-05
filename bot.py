@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -22,6 +23,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL или SUPABASE_KEY не заданы")
+
+GETBLOCK_API_KEY = os.environ.get("GETBLOCK_API_KEY")  # опционально
 
 FIXED_USD_CNY = os.environ.get("FIXED_USD_CNY")
 if FIXED_USD_CNY is not None:
@@ -283,7 +286,42 @@ def convert_generic(amount, rate, delta, is_buy):
     else:
         return amount * effective_rate, effective_rate
 
-# ---------- Форматирование текста курсов ----------
+def get_usdt_sell_rate():
+    rate = get_usdt_rub_rate()
+    return rate + get_today_deltas().get("usdt_rub", 0.0) if rate else None
+
+def get_usdt_buy_rate():
+    rate = get_usdt_rub_rate()
+    return rate - get_today_deltas().get("usdt_rub", 0.0) if rate else None
+
+def get_cny_sell_rate():
+    usdt_rub = get_usdt_rub_rate()
+    usdt_cny = get_usdt_cny_rate()
+    if usdt_rub is not None and usdt_cny is not None and usdt_cny != 0:
+        rate = (usdt_rub + get_today_deltas().get("usdt_rub", 0.0)) / (usdt_cny - get_today_deltas().get("cny_rub", 0.0))
+        return rate
+    direct = get_cny_rub_rate()
+    if direct is not None:
+        return direct + get_today_deltas().get("cny_rub", 0.0)
+    return None
+
+def get_cny_buy_rate():
+    usdt_rub = get_usdt_rub_rate()
+    usdt_cny = get_usdt_cny_rate()
+    if usdt_rub is not None and usdt_cny is not None and usdt_cny != 0:
+        rate = (usdt_rub - get_today_deltas().get("usdt_rub", 0.0)) / (usdt_cny + get_today_deltas().get("cny_rub", 0.0))
+        if rate <= 0:
+            direct = get_cny_rub_rate()
+            if direct is not None:
+                return direct - get_today_deltas().get("cny_rub", 0.0)
+            return None
+        return rate
+    direct = get_cny_rub_rate()
+    if direct is not None:
+        return direct - get_today_deltas().get("cny_rub", 0.0)
+    return None
+
+# ---------- Форматирование ----------
 def format_course_text():
     usd_rub = get_usd_rub_rate()
     usdt_rub = get_usdt_rub_rate()
@@ -312,6 +350,31 @@ def format_course_text():
     text += "\n📡 **Источники:** USD/RUB — ЦБ РФ, USDT/RUB — Rapira, CNY/RUB — ЦБ РФ, USD/CNY — Frankfurter (Forex), USDT/CNY — Frankfurter (Forex)"
     return text
 
+def format_convert_result(amount, from_cur, to_cur, result_without, result_with, effective_rate, standard_delta, delta_used, is_buy, use_custom_delta):
+    lines = [
+        f"💱 **Результат конвертации {amount:.2f} {from_cur}**",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"🔹 **Без дельты:** {result_without:.4f} {to_cur}",
+    ]
+    if use_custom_delta:
+        lines.append(f"🔸 **С вашей дельтой ({delta_used:.2f}):** **{result_with:.4f} {to_cur}**")
+        lines.append(f"📌 Стандартная дельта на сегодня: {standard_delta:.2f}")
+        profit_abs = result_without - result_with if is_buy else result_with - result_without
+        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
+        lines.append(f"💰 Прибыль от вашей дельты: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)")
+    else:
+        lines.append(f"🔸 **С дельтой ({standard_delta:.2f}):** **{result_with:.4f} {to_cur}**")
+        profit_abs = result_without - result_with if is_buy else result_with - result_without
+        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
+        lines.append(f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)")
+
+    if from_cur == "RUB" or to_cur == "RUB":
+        non_rub = to_cur if from_cur == "RUB" else from_cur
+        lines.append(f"💰 **Цена для клиента: {effective_rate:.2f} RUB за 1 {non_rub}**")
+    else:
+        lines.append(f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**")
+    return "\n".join(lines)
+
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -335,7 +398,131 @@ def convert_menu_keyboard():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_course")]
     ])
 
-# ---------- Обработчики команд ----------
+def need_currency_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="USDT", callback_data="need_currency_USDT"),
+         InlineKeyboardButton(text="CNY", callback_data="need_currency_CNY")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_course")]
+    ])
+
+# ---------- AML-провайдеры ----------
+class AMLProvider:
+    name = "Base"
+    def check(self, address: str, network: str = None) -> dict:
+        raise NotImplementedError
+
+class USDTBanListProvider(AMLProvider):
+    name = "USDTBanList"
+    def check(self, address: str, network: str = None) -> dict:
+        try:
+            url = f"https://api.usdtbanlist.com/v1/check?address={address}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                risk_score = 0
+                risk_level = "Низкий"
+                status = "✅ Чистый"
+                details = []
+                if data.get("is_blacklisted"):
+                    risk_score = 100
+                    risk_level = "Критический"
+                    status = "❌ Заблокирован"
+                    details.append("Адрес в чёрном списке USDT")
+                return {
+                    "source": self.name,
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                    "status": status,
+                    "details": details,
+                    "network": network or "TRON/ETH"
+                }
+        except Exception as e:
+            logger.warning(f"USDTBanList exception: {e}")
+        return None
+
+class GetBlockProvider(AMLProvider):
+    name = "GetBlock"
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+    def check(self, address: str, network: str = None) -> dict:
+        if not self.api_key:
+            return None
+        try:
+            url = "https://api.getblock.io/v1/aml/check"
+            headers = {"Content-Type": "application/json", "x-api-key": self.api_key}
+            payload = {"address": address, "network": network or "ETH"}
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                risk_score = data.get("risk_score", 0)
+                risk_level = data.get("risk_level", "Unknown")
+                risk_level_map = {"low": "Низкий", "medium": "Средний", "high": "Высокий", "critical": "Критический"}
+                risk_level = risk_level_map.get(risk_level, risk_level)
+                status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
+                details = data.get("tags", []) if isinstance(data.get("tags"), list) else []
+                return {
+                    "source": self.name,
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                    "status": status,
+                    "details": details,
+                    "network": network or "ETH"
+                }
+        except Exception as e:
+            logger.warning(f"GetBlock exception: {e}")
+        return None
+
+aml_providers = [USDTBanListProvider()]
+if GETBLOCK_API_KEY:
+    aml_providers.append(GetBlockProvider(GETBLOCK_API_KEY))
+
+async def aml_check(address: str, network: str = None) -> dict:
+    for provider in aml_providers:
+        try:
+            result = provider.check(address, network)
+            if result:
+                return result
+        except:
+            continue
+    return None
+
+def log_aml_check(user_id: int, address: str, result: dict):
+    try:
+        data = {
+            "user_id": user_id,
+            "wallet_address": address,
+            "network": result.get("network"),
+            "risk_score": result.get("risk_score"),
+            "risk_level": result.get("risk_level"),
+            "status": result.get("status"),
+            "details": json.dumps(result.get("details", [])),
+            "source": result.get("source"),
+        }
+        supabase.table("aml_checks").insert(data).execute()
+    except Exception as e:
+        logger.error(f"AML log error: {e}")
+
+def format_aml_report(address: str, result: dict) -> str:
+    lines = [
+        "🛡️ **AML-проверка кошелька**",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"📌 Адрес: `{address}`",
+        f"🔗 Сеть: {result.get('network', 'Неизвестно')}",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"📊 **Риск-скор: {result.get('risk_score', 0)}/100**",
+        f"📋 **Статус:** {result.get('status', '❌ Нет данных')}",
+        "━━━━━━━━━━━━━━━━━━━",
+    ]
+    if result.get("details"):
+        details_text = ", ".join(result.get("details"))
+        lines.append(f"📎 **Обнаруженные риски:** {details_text}")
+    else:
+        lines.append("📎 **Обнаруженные риски:** не найдено")
+    lines.append(f"📡 **Источник:** {result.get('source', 'Неизвестно')}")
+    lines.append(f"🕒 **Проверка выполнена:** {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    return "\n".join(lines)
+
+# ---------- Обработчики состояний ----------
 waiting_for = {}
 
 @dp.message(Command("start"))
@@ -378,15 +565,9 @@ async def need_cmd(message: Message):
     if not get_user(user_id):
         await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
         return
-    # Если пользователь уже что-то ждал, очищаем состояние
     if user_id in waiting_for:
         del waiting_for[user_id]
-    # Показываем выбор валюты
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="USDT", callback_data="need_currency_USDT"),
-         InlineKeyboardButton(text="CNY", callback_data="need_currency_CNY")]
-    ])
-    await message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=keyboard)
+    await message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=need_currency_keyboard())
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
@@ -400,11 +581,361 @@ async def help_cmd(message: Message):
         "/course – Показать курсы и дельты\n"
         "/convert – Открыть меню конвертации\n"
         "/need – Рассчитать стоимость покупки\n"
+        "/check_wallet <адрес> – AML-проверка кошелька\n"
+        "/check_history – История проверок\n"
+        "/check_stats – Статистика проверок\n"
         "/help – Эта справка\n\n"
         "💡 При конвертации можно указать индивидуальную дельту:\n"
         "Введите сумму и дельту через пробел, например:\n"
         "`1000000 1.50`"
     )
+
+# ---------- AML-команды ----------
+@dp.message(Command("check_wallet"))
+async def check_wallet_cmd(message: Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Укажите адрес кошелька.\nПример: `/check_wallet 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`", parse_mode="Markdown")
+        return
+    address = args[1].strip()
+    if not re.match(r'^[0-9a-zA-Z]{20,60}$', address):
+        await message.answer("❌ Некорректный формат адреса. Проверьте и попробуйте снова.")
+        return
+
+    await message.answer("⏳ Проверяю кошелёк...")
+    result = await aml_check(address)
+    if result is None:
+        await message.answer("❌ Не удалось выполнить проверку. Попробуйте позже или обратитесь к администратору.")
+        return
+
+    log_aml_check(user_id, address, result)
+    report = format_aml_report(address, result)
+    await message.answer(report, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+@dp.message(Command("check_history"))
+async def check_history_cmd(message: Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    try:
+        resp = supabase.table("aml_checks").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+        rows = resp.data
+        if not rows:
+            await message.answer("📭 У вас пока нет проверок.")
+            return
+        text = "📋 **История проверок**\n\n"
+        for row in rows:
+            text += f"🕒 {row['created_at'][:16].replace('T', ' ')}\n"
+            text += f"📌 `{row['wallet_address']}`\n"
+            text += f"📊 Риск: {row['risk_score']}/100 ({row['risk_level']})\n"
+            text += f"📡 {row.get('source', 'Unknown')}\n\n"
+        await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    except Exception as e:
+        logger.error(f"check_history error: {e}")
+        await message.answer("❌ Ошибка при получении истории.")
+
+@dp.message(Command("check_stats"))
+async def check_stats_cmd(message: Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        await message.answer("⛔ Доступ запрещён. Используйте /start для авторизации.")
+        return
+    try:
+        resp = supabase.table("aml_checks").select("*").execute()
+        all_rows = resp.data
+        total = len(all_rows)
+        if total == 0:
+            await message.answer("📊 Статистика пока пуста.")
+            return
+        high_risk = sum(1 for r in all_rows if r.get("risk_score", 0) >= 60)
+        medium_risk = sum(1 for r in all_rows if 30 <= r.get("risk_score", 0) < 60)
+        low_risk = sum(1 for r in all_rows if r.get("risk_score", 0) < 30)
+        text = (
+            f"📊 **Статистика AML-проверок**\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Всего проверок: {total}\n"
+            f"🟢 Низкий риск: {low_risk}\n"
+            f"🟡 Средний риск: {medium_risk}\n"
+            f"🔴 Высокий риск: {high_risk}\n"
+        )
+        await message.answer(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    except Exception as e:
+        logger.error(f"check_stats error: {e}")
+        await message.answer("❌ Ошибка при получении статистики.")
+
+# ---------- Обработка конвертации и стоимости покупки ----------
+@dp.callback_query(F.data == "refresh")
+async def refresh_cb(callback: CallbackQuery):
+    await callback.answer("Обновляю...")
+    get_usd_rub_rate(force=True)
+    get_usdt_rub_rate(force=True)
+    get_cny_rub_rate(force=True)
+    get_usd_cny_rate(force=True)
+    get_usdt_cny_rate(force=True)
+    await callback.message.answer(
+        format_course_text(),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "back_to_course")
+async def back_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        format_course_text(),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        f"🏦 Главное меню\n\n{format_course_text()}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "convert")
+async def convert_cb(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
+
+@dp.callback_query(F.data == "instruction")
+async def instruction_cb(callback: CallbackQuery):
+    await callback.answer()
+    text = (
+        "📘 **Краткая инструкция по дельте:**\n\n"
+        "• **RUB → USDT / CNY / USD**\n"
+        "  Положительная дельта = наценка (выше курс)\n"
+        "  Пример: `1000000 0.50`\n\n"
+        "• **USDT / CNY / USD → RUB**\n"
+        "  Отрицательная дельта = наценка (выше курс)\n"
+        "  Пример: `13000 -0.50`\n\n"
+        "• **USD → CNY** и **CNY → USD**\n"
+        "  Положительная дельта увеличивает курс.\n\n"
+        "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
+        "💰 **Цена для клиента** видна в результатах.\n\n"
+        "📌 Кнопка «Стоимость покупки» поможет быстро рассчитать, сколько рублей нужно для получения нужной суммы USDT или CNY."
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+@dp.callback_query(F.data.startswith("conv_"))
+async def conv_choice_cb(callback: CallbackQuery):
+    await callback.answer()
+    pair = callback.data.split("_")[1:]
+    if len(pair) != 2:
+        await callback.message.answer("Ошибка.")
+        return
+    from_cur, to_cur = pair
+    conv_key = f"conv_{from_cur}_{to_cur}"
+    waiting_for[callback.from_user.id] = conv_key
+
+    if from_cur == "RUB" and to_cur != "RUB":
+        hint = f"💡 Положительная дельта увеличивает цену для клиента (наценка).\nПример: 1000000 0.50"
+    elif from_cur != "RUB" and to_cur == "RUB":
+        hint = f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\nПример: 13000 -0.50"
+    else:
+        hint = f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\nПример: 1000 0.10"
+
+    await callback.message.answer(
+        f"💱 Введите сумму в {from_cur}:\n"
+        f"Можно указать дельту через пробел.\n"
+        f"{hint}",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "need")
+async def need_callback(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if user_id in waiting_for:
+        del waiting_for[user_id]
+    await callback.message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=need_currency_keyboard())
+
+@dp.callback_query(F.data.startswith("need_currency_"))
+async def need_currency_callback(callback: CallbackQuery):
+    await callback.answer()
+    currency = callback.data.split("_")[2]  # USDT или CNY
+    user_id = callback.from_user.id
+    waiting_for[user_id] = {"step": "need_amount", "currency": currency}
+    await callback.message.edit_text(f"💱 Введите сумму в {currency} (только число):")
+
+# ---------- Обработка текстовых сообщений ----------
+@dp.message(F.text)
+async def handle_text(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    logger.info(f"handle_text: user={user_id}, text={repr(text)}")
+
+    # ---- 1. Если пользователь НЕ авторизован, проверяем пароль ----
+    if not get_user(user_id):
+        stored_hash = get_password_hash()
+        if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
+            if add_user_db(user_id, message.from_user.username or ""):
+                await message.answer(
+                    f"✅ Доступ разрешён!\n\n{format_course_text()}",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard()
+                )
+                if user_id in waiting_for:
+                    del waiting_for[user_id]
+                return
+            else:
+                await message.answer("❌ Ошибка при сохранении пользователя. Попробуйте позже.")
+                return
+        else:
+            await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
+            return
+
+    # ---- 2. Если авторизован ----
+    if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
+        del waiting_for[user_id]
+
+    # ---- 3. Проверяем, ожидаем ли мы ввод ----
+    if user_id not in waiting_for:
+        await message.answer("Сначала выберите действие через меню.")
+        return
+
+    conv_type = waiting_for.get(user_id)
+
+    # ---- 4. Обработка стоимости покупки (словарь) ----
+    if isinstance(conv_type, dict):
+        if conv_type.get("step") == "need_amount" and "currency" in conv_type:
+            await handle_need_input(message, conv_type)
+            return
+        else:
+            del waiting_for[user_id]
+            await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
+            return
+
+    # ---- 5. Обработка обычной конвертации (строка) ----
+    if not isinstance(conv_type, str) or not conv_type.startswith("conv_"):
+        await message.answer("Сначала выберите направление конвертации через /convert.")
+        return
+
+    parts = text.split()
+    if len(parts) == 2:
+        try:
+            amount = float(parts[0].replace(',', '.'))
+            custom_delta = float(parts[1].replace(',', '.'))
+            if amount <= 0:
+                raise ValueError
+        except:
+            await message.answer("❌ Введите корректные числа: сумма и дельта, например `1000000 1.50`")
+            return
+        use_custom_delta = True
+    elif len(parts) == 1:
+        try:
+            amount = float(parts[0].replace(',', '.'))
+            if amount <= 0:
+                raise ValueError
+        except:
+            await message.answer("❌ Введите положительное число.")
+            return
+        custom_delta = None
+        use_custom_delta = False
+    else:
+        await message.answer("❌ Введите сумму, либо сумму и дельту через пробел, например `1000000 1.50`")
+        return
+
+    waiting_for.pop(user_id, None)
+
+    from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
+    is_buy = from_cur == "RUB"
+
+    if from_cur == "USD" or to_cur == "USD":
+        rate = get_usd_rub_rate()
+        delta_key = "usd_rub"
+    elif from_cur == "USDT" or to_cur == "USDT":
+        rate = get_usdt_rub_rate()
+        delta_key = "usdt_rub"
+    elif from_cur == "CNY" or to_cur == "CNY":
+        rate = get_cny_rub_rate()
+        delta_key = "cny_rub"
+    else:
+        await message.answer("❌ Неизвестная валюта.")
+        return
+
+    if rate is None:
+        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
+        return
+
+    deltas = get_today_deltas()
+    standard_delta = deltas.get(delta_key, 0.0)
+    delta_used = custom_delta if use_custom_delta else standard_delta
+
+    loading_msg = await message.answer("⏳ Конвертирую...")
+
+    if is_buy:
+        result = amount / (rate + delta_used)
+        result_without = amount / rate
+        result_with = amount / (rate + standard_delta)
+        effective_rate = rate + delta_used
+    else:
+        result = amount * (rate - delta_used)
+        result_without = amount * rate
+        result_with = amount * (rate - standard_delta)
+        effective_rate = rate - delta_used
+
+    if result is None:
+        await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
+        return
+
+    result_text = format_convert_result(amount, from_cur, to_cur, result_without, result_with, effective_rate, standard_delta, delta_used, is_buy, use_custom_delta)
+    await loading_msg.edit_text(result_text, parse_mode="Markdown")
+    await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
+
+# ---------- Обработка ввода для стоимости покупки ----------
+async def handle_need_input(message: Message, state: dict):
+    user_id = message.from_user.id
+    currency = state.get("currency")
+    if not currency:
+        await message.answer("Ошибка: не выбрана валюта. Попробуйте заново.")
+        if user_id in waiting_for:
+            del waiting_for[user_id]
+        return
+
+    text = message.text.strip()
+    try:
+        amount = float(text.replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Введите положительное число.")
+        return
+
+    if user_id in waiting_for:
+        del waiting_for[user_id]
+
+    if currency == "USDT":
+        rate = get_usdt_rub_rate()
+        standard_delta = get_today_deltas().get("usdt_rub", 0.0)
+    else:
+        rate = get_cny_rub_rate()
+        standard_delta = get_today_deltas().get("cny_rub", 0.0)
+
+    if rate is None:
+        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
+        return
+
+    final_rate = rate + standard_delta
+    total_rub = amount * final_rate
+
+    result_text = (
+        f"💱 **Стоимость покупки**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Вы хотите получить: **{amount:,.2f} {currency}**\n"
+        f"Курс: **{final_rate:.2f}** ₽ за 1 {currency}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **Итого: {total_rub:,.2f} ₽**"
+    )
+    await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 # ---------- Админ-команды ----------
 @dp.message(Command("set_delta_USD_RUB"))
@@ -566,314 +1097,6 @@ async def list_users_cmd(message: Message):
         text += f"ID: {u['id']}, Username: {u.get('username', '—')}\n"
     await message.answer(text, parse_mode="Markdown")
 
-# ---------- Обработка текста (главный обработчик) ----------
-@dp.message(F.text)
-async def handle_text(message: Message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    logger.info(f"handle_text: user={user_id}, text={repr(text)}")
-
-    # ---- 1. Если пользователь НЕ авторизован, любой ввод проверяем как пароль ----
-    if not get_user(user_id):
-        stored_hash = get_password_hash()
-        if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
-            if add_user_db(user_id, message.from_user.username or ""):
-                await message.answer(
-                    f"✅ Доступ разрешён!\n\n{format_course_text()}",
-                    parse_mode="Markdown",
-                    reply_markup=main_menu_keyboard()
-                )
-                if user_id in waiting_for:
-                    del waiting_for[user_id]
-                return
-            else:
-                await message.answer("❌ Ошибка при сохранении пользователя. Попробуйте позже.")
-                return
-        else:
-            await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
-            return
-
-    # ---- 2. Если пользователь авторизован ----
-    if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
-        del waiting_for[user_id]
-
-    # ---- 3. Проверяем, ожидаем ли мы ввод для конвертации (состояние строка) ----
-    if user_id not in waiting_for:
-        await message.answer("Сначала выберите действие через меню (обновить курс, конвертировать, стоимость покупки).")
-        return
-
-    conv_type = waiting_for.get(user_id)
-
-    # ---- 4. Если состояние — словарь (для "Стоимость покупки") ----
-    if isinstance(conv_type, dict):
-        # Убедимся, что это именно состояние для need
-        if conv_type.get("step") == "need_amount" and "currency" in conv_type:
-            await handle_need_input(message, conv_type)
-            return
-        else:
-            # Если словарь, но не для need — очищаем и просим выбрать заново
-            del waiting_for[user_id]
-            await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
-            return
-
-    # ---- 5. Если состояние — строка (для обычной конвертации) ----
-    if not isinstance(conv_type, str) or not conv_type.startswith("conv_"):
-        await message.answer("Сначала выберите направление конвертации через /convert.")
-        return
-
-    # ---- 6. Обработка обычной конвертации с дельтой ----
-    parts = text.split()
-    if len(parts) == 2:
-        try:
-            amount = float(parts[0].replace(',', '.'))
-            custom_delta = float(parts[1].replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-        except:
-            await message.answer("❌ Введите корректные числа: сумма и дельта, например `1000000 1.50`")
-            return
-        use_custom_delta = True
-    elif len(parts) == 1:
-        try:
-            amount = float(parts[0].replace(',', '.'))
-            if amount <= 0:
-                raise ValueError
-        except:
-            await message.answer("❌ Введите положительное число.")
-            return
-        custom_delta = None
-        use_custom_delta = False
-    else:
-        await message.answer("❌ Введите сумму, либо сумму и дельту через пробел, например `1000000 1.50`")
-        return
-
-    waiting_for.pop(user_id, None)
-
-    # Определяем направление
-    from_cur, to_cur = conv_type.split('_')[1], conv_type.split('_')[2]
-    is_buy = from_cur == "RUB"
-
-    # Получаем курс и дельту
-    if from_cur == "USD" or to_cur == "USD":
-        rate = get_usd_rub_rate()
-        delta_key = "usd_rub"
-    elif from_cur == "USDT" or to_cur == "USDT":
-        rate = get_usdt_rub_rate()
-        delta_key = "usdt_rub"
-    elif from_cur == "CNY" or to_cur == "CNY":
-        rate = get_cny_rub_rate()
-        delta_key = "cny_rub"
-    else:
-        await message.answer("❌ Неизвестная валюта.")
-        return
-
-    if rate is None:
-        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
-        return
-
-    deltas = get_today_deltas()
-    standard_delta = deltas.get(delta_key, 0.0)
-    delta_used = custom_delta if use_custom_delta else standard_delta
-
-    loading_msg = await message.answer("⏳ Конвертирую...")
-
-    if is_buy:
-        result = amount / (rate + delta_used)
-        result_without = amount / rate
-        result_with = amount / (rate + standard_delta)
-        effective_rate = rate + delta_used
-    else:
-        result = amount * (rate - delta_used)
-        result_without = amount * rate
-        result_with = amount * (rate - standard_delta)
-        effective_rate = rate - delta_used
-
-    if result is None:
-        await loading_msg.edit_text("❌ Не удалось выполнить конвертацию.")
-        return
-
-    if from_cur == "RUB" or to_cur == "RUB":
-        non_rub = to_cur if from_cur == "RUB" else from_cur
-        price = effective_rate
-        price_text = f"💰 **Цена для клиента: {price:.2f} RUB за 1 {non_rub}**"
-    else:
-        price_text = f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**"
-
-    result_text = f"💱 **Результат конвертации {amount:.2f} {from_cur}**\n\n"
-    if use_custom_delta:
-        result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
-        result_text += f"🔸 **С вашей дельтой ({delta_used:.2f}):** **{result:.4f} {to_cur}**\n"
-        result_text += f"📌 Стандартная дельта на сегодня: {standard_delta:.2f}\n"
-        profit_abs = result_without - result if is_buy else result - result_without
-        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
-        result_text += f"💰 Прибыль от вашей дельты: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
-    else:
-        result_text += f"🔹 **Без дельты:** {result_without:.4f} {to_cur}\n"
-        result_text += f"🔸 **С дельтой ({standard_delta:.2f}):** **{result_with:.4f} {to_cur}**\n"
-        profit_abs = result_without - result_with if is_buy else result_with - result_without
-        profit_percent = (profit_abs / result_without * 100) if result_without != 0 else 0
-        result_text += f"💰 Прибыль: {profit_abs:.4f} {to_cur} ({profit_percent:.2f}%)"
-
-    result_text += f"\n{price_text}"
-
-    await loading_msg.edit_text(result_text, parse_mode="Markdown")
-    await message.answer("🏠 Вернуться в главное меню:", reply_markup=main_menu_keyboard())
-
-# ---------- Функция обработки ввода для "Стоимость покупки" ----------
-async def handle_need_input(message: Message, state: dict):
-    user_id = message.from_user.id
-    currency = state.get("currency")
-    if not currency:
-        await message.answer("Ошибка: не выбрана валюта. Попробуйте заново.")
-        if user_id in waiting_for:
-            del waiting_for[user_id]
-        return
-
-    text = message.text.strip()
-    try:
-        amount = float(text.replace(',', '.'))
-        if amount <= 0:
-            raise ValueError
-    except:
-        await message.answer("❌ Введите положительное число.")
-        return
-
-    # Удаляем состояние
-    if user_id in waiting_for:
-        del waiting_for[user_id]
-
-    # Рассчитываем стоимость
-    if currency == "USDT":
-        rate = get_usdt_rub_rate()
-        standard_delta = get_today_deltas().get("usdt_rub", 0.0)
-    else:  # CNY
-        rate = get_cny_rub_rate()
-        standard_delta = get_today_deltas().get("cny_rub", 0.0)
-
-    if rate is None:
-        await message.answer("❌ Не удалось получить курс. Попробуйте позже.")
-        return
-
-    final_rate = rate + standard_delta
-    total_rub = amount * final_rate
-
-    result_text = (
-        f"💱 **Стоимость покупки**\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Вы хотите получить: **{amount:,.2f} {currency}**\n"
-        f"Курс: **{final_rate:.2f}** ₽ за 1 {currency}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 **Итого: {total_rub:,.2f} ₽**"
-    )
-
-    await message.answer(result_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-# ---------- Коллбэки ----------
-@dp.callback_query(F.data == "refresh")
-async def refresh_cb(callback: CallbackQuery):
-    await callback.answer("Обновляю...")
-    get_usd_rub_rate(force=True)
-    get_usdt_rub_rate(force=True)
-    get_cny_rub_rate(force=True)
-    get_usd_cny_rate(force=True)
-    get_usdt_cny_rate(force=True)
-    await callback.message.answer(
-        format_course_text(),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "back_to_course")
-async def back_cb(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        format_course_text(),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "main_menu")
-async def main_menu_cb(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        f"🏦 Главное меню\n\n{format_course_text()}",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "convert")
-async def convert_cb(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer("Выберите направление конвертации:", reply_markup=convert_menu_keyboard())
-
-@dp.callback_query(F.data == "instruction")
-async def instruction_cb(callback: CallbackQuery):
-    await callback.answer()
-    text = (
-        "📘 **Краткая инструкция по дельте:**\n\n"
-        "• **RUB → USDT / CNY / USD**\n"
-        "  Положительная дельта = наценка (выше курс)\n"
-        "  Пример: `1000000 0.50`\n\n"
-        "• **USDT / CNY / USD → RUB**\n"
-        "  Отрицательная дельта = наценка (выше курс)\n"
-        "  Пример: `13000 -0.50`\n\n"
-        "• **USD → CNY** и **CNY → USD**\n"
-        "  Положительная дельта увеличивает курс.\n\n"
-        "💡 **Важно:** всегда указывайте сумму и дельту через пробел.\n"
-        "💰 **Цена для клиента** видна в результатах.\n\n"
-        "📌 Кнопка «Стоимость покупки» поможет быстро рассчитать, сколько рублей нужно для получения нужной суммы USDT или CNY."
-    )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-@dp.callback_query(F.data.startswith("conv_"))
-async def conv_choice_cb(callback: CallbackQuery):
-    await callback.answer()
-    pair = callback.data.split("_")[1:]
-    if len(pair) != 2:
-        await callback.message.answer("Ошибка.")
-        return
-    from_cur, to_cur = pair
-    conv_key = f"conv_{from_cur}_{to_cur}"
-    waiting_for[callback.from_user.id] = conv_key
-
-    if from_cur == "RUB" and to_cur != "RUB":
-        hint = f"💡 Положительная дельта увеличивает цену для клиента (наценка).\nПример: 1000000 0.50"
-    elif from_cur != "RUB" and to_cur == "RUB":
-        hint = f"💡 Отрицательная дельта увеличивает цену для клиента (наценка).\nПример: 13000 -0.50"
-    else:
-        hint = f"💡 Для пары {from_cur}/{to_cur} дельта работает как наценка при положительном значении.\nПример: 1000 0.10"
-
-    await callback.message.answer(
-        f"💱 Введите сумму в {from_cur}:\n"
-        f"Можно указать дельту через пробел.\n"
-        f"{hint}",
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "need")
-async def need_callback(callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    # Очищаем старое состояние, если было
-    if user_id in waiting_for:
-        del waiting_for[user_id]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="USDT", callback_data="need_currency_USDT"),
-         InlineKeyboardButton(text="CNY", callback_data="need_currency_CNY")]
-    ])
-    await callback.message.answer("💱 Выберите валюту, которую хотите получить:", reply_markup=keyboard)
-
-@dp.callback_query(F.data.startswith("need_currency_"))
-async def need_currency_callback(callback: CallbackQuery):
-    await callback.answer()
-    currency = callback.data.split("_")[2]  # USDT или CNY
-    user_id = callback.from_user.id
-    # Сохраняем состояние как словарь
-    waiting_for[user_id] = {"step": "need_amount", "currency": currency}
-    await callback.message.edit_text(
-        f"💱 Введите сумму в {currency} (только число):"
-    )
-
 # ---------- Запуск ----------
 async def main():
     await bot.set_my_commands([
@@ -881,6 +1104,9 @@ async def main():
         BotCommand(command="course", description="💰 Курсы и дельты"),
         BotCommand(command="convert", description="💱 Конвертация валют"),
         BotCommand(command="need", description="💰 Стоимость покупки"),
+        BotCommand(command="check_wallet", description="🛡️ AML-проверка кошелька"),
+        BotCommand(command="check_history", description="📋 История проверок"),
+        BotCommand(command="check_stats", description="📊 Статистика проверок"),
         BotCommand(command="help", description="❓ Помощь")
     ])
     await dp.start_polling(bot, skip_updates=True)
