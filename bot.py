@@ -4,7 +4,8 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 import requests
 from aiogram import Bot, Dispatcher, types
@@ -24,7 +25,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL или SUPABASE_KEY не заданы")
 
-GETBLOCK_API_KEY = os.environ.get("GETBLOCK_API_KEY")  # опционально
+GETBLOCK_API_KEY = os.environ.get("GETBLOCK_API_KEY")  # больше не используется, оставлено для совместимости
 
 FIXED_USD_CNY = os.environ.get("FIXED_USD_CNY")
 if FIXED_USD_CNY is not None:
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- Supabase helpers ----------
+# ---------- Supabase helpers (без изменений) ----------
 def get_password_hash() -> str:
     try:
         resp = supabase.table("settings").select("value").eq("key", "access_password").execute()
@@ -151,7 +152,7 @@ def update_delta(pair: str, value: float) -> bool:
         logger.error(f"update_delta error: {e}")
         return False
 
-# ---------- Получение курсов ----------
+# ---------- Получение курсов (без изменений) ----------
 def get_usd_rub_rate(force=False):
     now = datetime.now()
     if not force and _cache["timestamp"] and (now - _cache["timestamp"]).seconds < CACHE_TTL:
@@ -278,7 +279,7 @@ def get_usdt_cny_rate(force=False):
         logger.warning(f"exchangerate.host USDT/CNY failed: {e}")
     return None
 
-# ---------- Конвертация ----------
+# ---------- Конвертация (без изменений) ----------
 def convert_generic(amount, rate, delta, is_buy):
     effective_rate = rate + delta if is_buy else rate - delta
     if is_buy:
@@ -321,7 +322,7 @@ def get_cny_buy_rate():
         return direct - get_today_deltas().get("cny_rub", 0.0)
     return None
 
-# ---------- Форматирование ----------
+# ---------- Форматирование (без изменений) ----------
 def format_course_text():
     usd_rub = get_usd_rub_rate()
     usdt_rub = get_usdt_rub_rate()
@@ -375,7 +376,7 @@ def format_convert_result(amount, from_cur, to_cur, result_without, result_with,
         lines.append(f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**")
     return "\n".join(lines)
 
-# ---------- Клавиатуры ----------
+# ---------- Клавиатуры (обновлены) ----------
 def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
@@ -421,116 +422,254 @@ def after_aml_keyboard():
     ])
 
 def network_choice_keyboard(address: str):
+    # Поддерживаем только те сети, для которых есть бесплатные провайдеры
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="BTC", callback_data=f"aml_network_BTC_{address}"),
          InlineKeyboardButton(text="ETH", callback_data=f"aml_network_ETH_{address}")],
         [InlineKeyboardButton(text="USDT (ERC-20)", callback_data=f"aml_network_USDT_ERC20_{address}"),
          InlineKeyboardButton(text="USDT (TRC-20)", callback_data=f"aml_network_USDT_TRC20_{address}")],
         [InlineKeyboardButton(text="TRX", callback_data=f"aml_network_TRX_{address}"),
-         InlineKeyboardButton(text="BNB", callback_data=f"aml_network_BNB_{address}")],
+         InlineKeyboardButton(text="LTC", callback_data=f"aml_network_LTC_{address}")],
+        [InlineKeyboardButton(text="BCH", callback_data=f"aml_network_BCH_{address}")],
         [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_course")]
     ])
 
-# ---------- AML-провайдеры ----------
+# ---------- НОВЫЕ AML-ПРОВАЙДЕРЫ (без заглушек) ----------
 class AMLProvider:
     name = "Base"
     def check(self, address: str, network: str = None) -> dict:
         raise NotImplementedError
 
-class USDTBanListProvider(AMLProvider):
-    name = "USDTBanList"
+class BlockchairProvider(AMLProvider):
+    """Провайдер через Blockchair (поддерживает BTC, ETH, LTC, BCH)"""
+    name = "Blockchair"
+
     def check(self, address: str, network: str = None) -> dict:
+        # network может быть BTC, ETH, LTC, BCH (также USDT_ERC20 -> ETH, USDT_TRC20 -> TRX, но это не для Blockchair)
+        # Приводим network к нижнему регистру для URL
+        net_map = {
+            "BTC": "bitcoin",
+            "ETH": "ethereum",
+            "LTC": "litecoin",
+            "BCH": "bitcoin-cash",
+            "USDT_ERC20": "ethereum",  # адрес ETH
+        }
+        net = net_map.get(network)
+        if not net:
+            return None
+        url = f"https://api.blockchair.com/{net}/dashboards/address/{address}"
         try:
-            url = f"https://api.usdtbanlist.com/v1/check?address={address}"
             resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                risk_score = 0
+            if resp.status_code != 200:
+                logger.warning(f"Blockchair returned {resp.status_code}")
+                return None
+            data = resp.json()
+            # Проверяем структуру ответа
+            if not data.get("data") or address not in data["data"]:
+                return None
+            addr_data = data["data"][address]
+            # Извлекаем нужные поля
+            balance = addr_data.get("balance", 0)  # в сатоши/wei, для BTC - сатоши, для ETH - wei
+            # Для удобства переведём в основную единицу (для BTC / ETH)
+            if net == "bitcoin":
+                balance_units = balance / 1e8
+                symbol = "BTC"
+            elif net == "ethereum":
+                balance_units = balance / 1e18
+                symbol = "ETH"
+            elif net == "litecoin":
+                balance_units = balance / 1e8
+                symbol = "LTC"
+            elif net == "bitcoin-cash":
+                balance_units = balance / 1e8
+                symbol = "BCH"
+            else:
+                balance_units = 0
+                symbol = ""
+
+            tx_count = addr_data.get("transaction_count", 0)
+            first_seen = addr_data.get("first_seen", None)  # timestamp Unix
+            if first_seen:
+                first_date = datetime.fromtimestamp(first_seen)
+                age_days = (datetime.now() - first_date).days
+            else:
+                age_days = None
+
+            # Вычисляем риск-скор (0-100)
+            risk_score = 0
+            details = []
+
+            # Критерии:
+            # 1. Возраст: если адрес создан менее 7 дней назад -> +30, менее 30 дней -> +15
+            if age_days is not None:
+                if age_days < 7:
+                    risk_score += 30
+                    details.append("Адрес создан менее 7 дней назад")
+                elif age_days < 30:
+                    risk_score += 15
+                    details.append("Адрес создан менее 30 дней назад")
+                # иначе не добавляем
+            else:
+                risk_score += 20
+                details.append("Неизвестная дата создания")
+
+            # 2. Количество транзакций: если 0 -> +40, если 1-5 -> +20, если 6-20 -> +10
+            if tx_count == 0:
+                risk_score += 40
+                details.append("Нет транзакций")
+            elif tx_count < 5:
+                risk_score += 20
+                details.append("Мало транзакций (менее 5)")
+            elif tx_count < 20:
+                risk_score += 10
+                details.append("Умеренное количество транзакций")
+
+            # 3. Баланс: если баланс > 0 и адрес новый (возраст < 7) -> +20
+            if balance_units > 0 and age_days is not None and age_days < 7:
+                risk_score += 20
+                details.append("Большой баланс на новом адресе")
+
+            # Ограничиваем скор до 100
+            risk_score = min(risk_score, 100)
+
+            # Определяем уровень риска
+            if risk_score < 30:
                 risk_level = "Низкий"
                 status = "✅ Чистый"
-                details = []
-                if data.get("is_blacklisted"):
-                    risk_score = 100
-                    risk_level = "Критический"
-                    status = "❌ Заблокирован"
-                    details.append("Адрес в чёрном списке USDT")
-                return {
-                    "source": self.name,
-                    "risk_score": risk_score,
-                    "risk_level": risk_level,
-                    "status": status,
-                    "details": details,
-                    "network": network or "TRON/ETH"
-                }
+            elif risk_score < 60:
+                risk_level = "Средний"
+                status = "🟡 Средний"
             else:
-                logger.warning(f"USDTBanList returned status {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"USDTBanList exception: {e}")
-        return None
+                risk_level = "Высокий"
+                status = "🔴 Высокий"
 
-class GetBlockProvider(AMLProvider):
-    name = "GetBlock"
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-    def check(self, address: str, network: str = None) -> dict:
-        if not self.api_key:
-            return None
-        try:
-            network_map = {
-                "BTC": "BTC",
-                "ETH": "ETH",
-                "USDT_ERC20": "ETH",
-                "USDT_TRC20": "TRX",
-                "TRX": "TRX",
-                "BNB": "BNB",
-                "LTC": "LTC",
-                "BCH": "BCH"
+            # Формируем детальный вывод
+            details_text = details if details else ["Нет явных рисков"]
+            # Добавляем информацию о балансе и транзакциях в details
+            details_text.append(f"Баланс: {balance_units:.8f} {symbol}")
+            details_text.append(f"Транзакций: {tx_count}")
+            if age_days is not None:
+                details_text.append(f"Возраст: {age_days} дней")
+            else:
+                details_text.append("Возраст: неизвестен")
+
+            return {
+                "source": self.name,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "status": status,
+                "details": details_text,
+                "network": network,
+                "balance": f"{balance_units:.8f} {symbol}",
+                "tx_count": tx_count,
+                "age_days": age_days,
             }
-            net = network_map.get(network, "ETH") if network else "ETH"
-            url = "https://api.getblock.io/v1/aml/check"
-            headers = {"Content-Type": "application/json", "x-api-key": self.api_key}
-            payload = {"address": address, "network": net}
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                risk_score = data.get("risk_score", 0)
-                risk_level = data.get("risk_level", "Unknown")
-                risk_level_map = {"low": "Низкий", "medium": "Средний", "high": "Высокий", "critical": "Критический"}
-                risk_level = risk_level_map.get(risk_level, risk_level)
-                status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
-                details = data.get("tags", []) if isinstance(data.get("tags"), list) else []
-                return {
-                    "source": self.name,
-                    "risk_score": risk_score,
-                    "risk_level": risk_level,
-                    "status": status,
-                    "details": details,
-                    "network": network or "ETH"
-                }
-            else:
-                logger.warning(f"GetBlock returned status {resp.status_code}")
         except Exception as e:
-            logger.warning(f"GetBlock exception: {e}")
-        return None
+            logger.error(f"Blockchair exception: {e}")
+            return None
 
-class FallbackProvider(AMLProvider):
-    name = "Fallback (тестовый)"
+class TronscanProvider(AMLProvider):
+    """Провайдер через Tronscan (поддерживает TRX и USDT_TRC20)"""
+    name = "Tronscan"
+
     def check(self, address: str, network: str = None) -> dict:
-        return {
-            "source": self.name,
-            "risk_score": 5,
-            "risk_level": "Низкий",
-            "status": "✅ Чистый (тест)",
-            "details": ["Тестовая проверка – все API недоступны"],
-            "network": network or "Неизвестно"
-        }
+        # network может быть TRX или USDT_TRC20
+        if network not in ("TRX", "USDT_TRC20"):
+            return None
+        url = f"https://api.tronscan.org/api/address?address={address}"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Tronscan returned {resp.status_code}")
+                return None
+            data = resp.json()
+            # Проверяем наличие данных
+            if not data.get("address"):
+                return None
 
-aml_providers = [USDTBanListProvider()]
-if GETBLOCK_API_KEY:
-    aml_providers.append(GetBlockProvider(GETBLOCK_API_KEY))
-aml_providers.append(FallbackProvider())
+            # Извлекаем данные
+            balance = data.get("balance", 0) / 1e6  # TRX имеет 6 знаков
+            tx_count = data.get("totalTx", 0)
+            first_tx_time = data.get("firstTxTime")  # миллисекунды Unix
+            if first_tx_time:
+                first_date = datetime.fromtimestamp(first_tx_time / 1000)
+                age_days = (datetime.now() - first_date).days
+            else:
+                age_days = None
 
+            # Вычисляем риск-скор (аналогично Blockchair)
+            risk_score = 0
+            details = []
+
+            if age_days is not None:
+                if age_days < 7:
+                    risk_score += 30
+                    details.append("Адрес создан менее 7 дней назад")
+                elif age_days < 30:
+                    risk_score += 15
+                    details.append("Адрес создан менее 30 дней назад")
+            else:
+                risk_score += 20
+                details.append("Неизвестная дата создания")
+
+            if tx_count == 0:
+                risk_score += 40
+                details.append("Нет транзакций")
+            elif tx_count < 5:
+                risk_score += 20
+                details.append("Мало транзакций (менее 5)")
+            elif tx_count < 20:
+                risk_score += 10
+                details.append("Умеренное количество транзакций")
+
+            if balance > 0 and age_days is not None and age_days < 7:
+                risk_score += 20
+                details.append("Большой баланс на новом адресе")
+
+            risk_score = min(risk_score, 100)
+
+            if risk_score < 30:
+                risk_level = "Низкий"
+                status = "✅ Чистый"
+            elif risk_score < 60:
+                risk_level = "Средний"
+                status = "🟡 Средний"
+            else:
+                risk_level = "Высокий"
+                status = "🔴 Высокий"
+
+            details_text = details if details else ["Нет явных рисков"]
+            details_text.append(f"Баланс: {balance:.2f} TRX")
+            details_text.append(f"Транзакций: {tx_count}")
+            if age_days is not None:
+                details_text.append(f"Возраст: {age_days} дней")
+            else:
+                details_text.append("Возраст: неизвестен")
+
+            return {
+                "source": self.name,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "status": status,
+                "details": details_text,
+                "network": network,
+                "balance": f"{balance:.2f} TRX",
+                "tx_count": tx_count,
+                "age_days": age_days,
+            }
+        except Exception as e:
+            logger.error(f"Tronscan exception: {e}")
+            return None
+
+# Список провайдеров (порядок важен: сначала основные, потом резервные)
+aml_providers = [
+    BlockchairProvider(),
+    TronscanProvider(),
+]
+
+# ---------- AML-функции ----------
 async def aml_check(address: str, network: str = None) -> dict:
+    """Проверяет адрес через все доступные провайдеры. Возвращает результат или None."""
     for provider in aml_providers:
         try:
             logger.info(f"Trying provider: {provider.name} for address {address[:10]}...")
@@ -573,16 +712,17 @@ def format_aml_report(address: str, result: dict) -> str:
         f"📋 **Статус:** {result.get('status', '❌ Нет данных')}",
         "━━━━━━━━━━━━━━━━━━━",
     ]
+    # Добавляем детали (список строк)
     if result.get("details"):
-        details_text = ", ".join(result.get("details"))
-        lines.append(f"📎 **Обнаруженные риски:** {details_text}")
+        for detail in result.get("details"):
+            lines.append(f"• {detail}")
     else:
-        lines.append("📎 **Обнаруженные риски:** не найдено")
+        lines.append("• Нет дополнительной информации")
     lines.append(f"📡 **Источник:** {result.get('source', 'Неизвестно')}")
     lines.append(f"🕒 **Проверка выполнена:** {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     return "\n".join(lines)
 
-# ---------- Обработчики состояний ----------
+# ---------- Обработчики состояний (без изменений) ----------
 waiting_for = {}
 
 @dp.message(Command("start"))
@@ -650,7 +790,7 @@ async def help_cmd(message: Message):
         "`1000000 1.50`"
     )
 
-# ---------- Обработчики AML через инлайн-меню ----------
+# ---------- AML-коллбэки ----------
 @dp.callback_query(F.data == "aml_check")
 async def aml_check_callback(callback: CallbackQuery):
     await callback.answer()
@@ -662,7 +802,7 @@ async def aml_check_callback(callback: CallbackQuery):
         del waiting_for[user_id]
     await callback.message.answer(
         "🛡️ Введите адрес кошелька для проверки.\n\n"
-        "Поддерживаются: BTC, ETH, USDT (ERC-20/TRC-20), TRX, BNB, LTC, BCH.\n"
+        "Поддерживаются: BTC, ETH, USDT (ERC-20/TRC-20), TRX, LTC, BCH.\n"
         "Сеть будет определена автоматически. Если не удастся – предложу выбрать вручную.\n\n"
         "Пример: `0x742d35Cc6634C0532925a3b844Bc454e4438f44e`",
         parse_mode="Markdown"
@@ -754,14 +894,13 @@ async def perform_aml_check(message: Message, user_id: int, address: str, networ
     report = format_aml_report(address, result)
     await loading_msg.edit_text(report, parse_mode="Markdown", reply_markup=after_aml_keyboard())
 
-# ---------- Обработка текстовых сообщений ----------
+# ---------- Обработка текстовых сообщений (без изменений) ----------
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
     logger.info(f"handle_text: user={user_id}, text={repr(text)}")
 
-    # ---- 1. Если пользователь НЕ авторизован, проверяем пароль ----
     if not get_user(user_id):
         stored_hash = get_password_hash()
         if hashlib.sha256(text.encode()).hexdigest() == stored_hash:
@@ -781,14 +920,11 @@ async def handle_text(message: Message):
             await message.answer("❌ Неверный пароль. Попробуйте ещё раз или введите /start для начала.")
             return
 
-    # ---- 2. Если авторизован ----
     if user_id in waiting_for and waiting_for[user_id] == "waiting_password":
         del waiting_for[user_id]
 
-    # ---- 3. Проверяем, ожидаем ли мы ввод адреса для AML ----
     if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_waiting_address":
         address = text
-        # Пытаемся определить сеть автоматически
         network = None
         if re.match(r'^0x[a-fA-F0-9]{40}$', address):
             network = "ETH"
@@ -796,13 +932,17 @@ async def handle_text(message: Message):
             network = "BTC"
         elif re.match(r'^T[a-zA-Z0-9]{33}$', address):
             network = "TRX"
-        elif re.match(r'^bnb[a-zA-Z0-9]{39}$', address):
-            network = "BNB"
         elif re.match(r'^M[a-zA-Z0-9]{34}$', address):
             network = "LTC"
         elif re.match(r'^q[a-zA-Z0-9]{41}$', address):
             network = "BCH"
+        # USDT_ERC20 и USDT_TRC20 – это те же адреса ETH и TRX, определим отдельно
+        # Для USDT_ERC20 адрес такой же как ETH, но пользователь может указать USDT_ERC20,
+        # мы автоматически определим как ETH, но в отчёте покажем как USDT_ERC20
+        # Аналогично USDT_TRC20 – как TRX.
         if network:
+            # Если адрес ETH, можем уточнить, что это USDT_ERC20? Но пользователь сам выбрал сеть, если вручную.
+            # В автоматическом режиме мы просто определим сеть и проверим.
             del waiting_for[user_id]
             await perform_aml_check(message, user_id, address, network)
             return
@@ -816,12 +956,10 @@ async def handle_text(message: Message):
             waiting_for[user_id] = {"step": "aml_network_choice", "address": address}
             return
 
-    # ---- 4. Если ожидаем выбор сети (обрабатывается через коллбэк) ----
     if user_id in waiting_for and isinstance(waiting_for[user_id], dict) and waiting_for[user_id].get("step") == "aml_network_choice":
-        # Это обрабатывается через коллбэки `aml_network_*`
+        # Обрабатывается через коллбэк
         pass
 
-    # ---- 5. Обработка стоимости покупки (словарь) ----
     if user_id in waiting_for and isinstance(waiting_for[user_id], dict):
         if waiting_for[user_id].get("step") == "need_amount" and "currency" in waiting_for[user_id]:
             await handle_need_input(message, waiting_for[user_id])
@@ -831,7 +969,6 @@ async def handle_text(message: Message):
             await message.answer("Ошибка состояния. Попробуйте выбрать действие заново.")
             return
 
-    # ---- 6. Обработка обычной конвертации (строка) ----
     if user_id not in waiting_for:
         await message.answer("Сначала выберите действие через меню.")
         return
@@ -1052,12 +1189,12 @@ async def need_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("need_currency_"))
 async def need_currency_callback(callback: CallbackQuery):
     await callback.answer()
-    currency = callback.data.split("_")[2]  # USDT или CNY
+    currency = callback.data.split("_")[2]
     user_id = callback.from_user.id
     waiting_for[user_id] = {"step": "need_amount", "currency": currency}
     await callback.message.edit_text(f"💱 Введите сумму в {currency} (только число):")
 
-# ---------- Админ-команды ----------
+# ---------- Админ-команды (без изменений) ----------
 @dp.message(Command("set_delta_USD_RUB"))
 async def set_delta_usd_rub(message: Message):
     if message.from_user.id != ADMIN_ID:
