@@ -25,7 +25,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL или SUPABASE_KEY не заданы")
 
-GETBLOCK_API_KEY = os.environ.get("GETBLOCK_API_KEY")  # больше не используется, оставлено для совместимости
+GETBLOCK_API_KEY = os.environ.get("GETBLOCK_API_KEY")  # больше не используется
 
 FIXED_USD_CNY = os.environ.get("FIXED_USD_CNY")
 if FIXED_USD_CNY is not None:
@@ -376,7 +376,7 @@ def format_convert_result(amount, from_cur, to_cur, result_without, result_with,
         lines.append(f"💰 **1 {from_cur} = {effective_rate:.2f} {to_cur}**")
     return "\n".join(lines)
 
-# ---------- Клавиатуры (обновлены) ----------
+# ---------- Клавиатуры ----------
 def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить курс", callback_data="refresh")],
@@ -422,7 +422,6 @@ def after_aml_keyboard():
     ])
 
 def network_choice_keyboard(address: str):
-    # Поддерживаем только те сети, для которых есть бесплатные провайдеры
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="BTC", callback_data=f"aml_network_BTC_{address}"),
          InlineKeyboardButton(text="ETH", callback_data=f"aml_network_ETH_{address}")],
@@ -434,25 +433,22 @@ def network_choice_keyboard(address: str):
         [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_course")]
     ])
 
-# ---------- НОВЫЕ AML-ПРОВАЙДЕРЫ (без заглушек) ----------
+# ---------- НОВЫЕ AML-ПРОВАЙДЕРЫ (без заглушек, с резервированием) ----------
 class AMLProvider:
     name = "Base"
     def check(self, address: str, network: str = None) -> dict:
         raise NotImplementedError
 
+# -------- 1. Blockchair (основной) --------
 class BlockchairProvider(AMLProvider):
-    """Провайдер через Blockchair (поддерживает BTC, ETH, LTC, BCH)"""
     name = "Blockchair"
-
     def check(self, address: str, network: str = None) -> dict:
-        # network может быть BTC, ETH, LTC, BCH (также USDT_ERC20 -> ETH, USDT_TRC20 -> TRX, но это не для Blockchair)
-        # Приводим network к нижнему регистру для URL
         net_map = {
             "BTC": "bitcoin",
             "ETH": "ethereum",
             "LTC": "litecoin",
             "BCH": "bitcoin-cash",
-            "USDT_ERC20": "ethereum",  # адрес ETH
+            "USDT_ERC20": "ethereum",
         }
         net = net_map.get(network)
         if not net:
@@ -464,13 +460,43 @@ class BlockchairProvider(AMLProvider):
                 logger.warning(f"Blockchair returned {resp.status_code}")
                 return None
             data = resp.json()
-            # Проверяем структуру ответа
             if not data.get("data") or address not in data["data"]:
                 return None
             addr_data = data["data"][address]
-            # Извлекаем нужные поля
-            balance = addr_data.get("balance", 0)  # в сатоши/wei, для BTC - сатоши, для ETH - wei
-            # Для удобства переведём в основную единицу (для BTC / ETH)
+            balance = addr_data.get("balance", 0)
+            tx_count = addr_data.get("transaction_count", 0)
+            first_seen = addr_data.get("first_seen", None)
+            if first_seen:
+                first_date = datetime.fromtimestamp(first_seen)
+                age_days = (datetime.now() - first_date).days
+            else:
+                age_days = None
+
+            # Вычисляем риск
+            risk_score = 0
+            details = []
+            if age_days is not None:
+                if age_days < 7:
+                    risk_score += 30
+                    details.append("Адрес создан менее 7 дней назад")
+                elif age_days < 30:
+                    risk_score += 15
+                    details.append("Адрес создан менее 30 дней назад")
+            else:
+                risk_score += 20
+                details.append("Неизвестная дата создания")
+
+            if tx_count == 0:
+                risk_score += 40
+                details.append("Нет транзакций")
+            elif tx_count < 5:
+                risk_score += 20
+                details.append("Мало транзакций (менее 5)")
+            elif tx_count < 20:
+                risk_score += 10
+                details.append("Умеренное количество транзакций")
+
+            # Баланс в основной единице
             if net == "bitcoin":
                 balance_units = balance / 1e8
                 symbol = "BTC"
@@ -487,71 +513,18 @@ class BlockchairProvider(AMLProvider):
                 balance_units = 0
                 symbol = ""
 
-            tx_count = addr_data.get("transaction_count", 0)
-            first_seen = addr_data.get("first_seen", None)  # timestamp Unix
-            if first_seen:
-                first_date = datetime.fromtimestamp(first_seen)
-                age_days = (datetime.now() - first_date).days
-            else:
-                age_days = None
-
-            # Вычисляем риск-скор (0-100)
-            risk_score = 0
-            details = []
-
-            # Критерии:
-            # 1. Возраст: если адрес создан менее 7 дней назад -> +30, менее 30 дней -> +15
-            if age_days is not None:
-                if age_days < 7:
-                    risk_score += 30
-                    details.append("Адрес создан менее 7 дней назад")
-                elif age_days < 30:
-                    risk_score += 15
-                    details.append("Адрес создан менее 30 дней назад")
-                # иначе не добавляем
-            else:
-                risk_score += 20
-                details.append("Неизвестная дата создания")
-
-            # 2. Количество транзакций: если 0 -> +40, если 1-5 -> +20, если 6-20 -> +10
-            if tx_count == 0:
-                risk_score += 40
-                details.append("Нет транзакций")
-            elif tx_count < 5:
-                risk_score += 20
-                details.append("Мало транзакций (менее 5)")
-            elif tx_count < 20:
-                risk_score += 10
-                details.append("Умеренное количество транзакций")
-
-            # 3. Баланс: если баланс > 0 и адрес новый (возраст < 7) -> +20
             if balance_units > 0 and age_days is not None and age_days < 7:
                 risk_score += 20
                 details.append("Большой баланс на новом адресе")
 
-            # Ограничиваем скор до 100
             risk_score = min(risk_score, 100)
+            risk_level = "Низкий" if risk_score < 30 else ("Средний" if risk_score < 60 else "Высокий")
+            status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
 
-            # Определяем уровень риска
-            if risk_score < 30:
-                risk_level = "Низкий"
-                status = "✅ Чистый"
-            elif risk_score < 60:
-                risk_level = "Средний"
-                status = "🟡 Средний"
-            else:
-                risk_level = "Высокий"
-                status = "🔴 Высокий"
-
-            # Формируем детальный вывод
             details_text = details if details else ["Нет явных рисков"]
-            # Добавляем информацию о балансе и транзакциях в details
             details_text.append(f"Баланс: {balance_units:.8f} {symbol}")
             details_text.append(f"Транзакций: {tx_count}")
-            if age_days is not None:
-                details_text.append(f"Возраст: {age_days} дней")
-            else:
-                details_text.append("Возраст: неизвестен")
+            details_text.append(f"Возраст: {age_days} дней" if age_days is not None else "Возраст: неизвестен")
 
             return {
                 "source": self.name,
@@ -568,12 +541,162 @@ class BlockchairProvider(AMLProvider):
             logger.error(f"Blockchair exception: {e}")
             return None
 
-class TronscanProvider(AMLProvider):
-    """Провайдер через Tronscan (поддерживает TRX и USDT_TRC20)"""
-    name = "Tronscan"
-
+# -------- 2. Ethplorer (для ETH и USDT_ERC20, публичный ключ "freekey") --------
+class EthplorerProvider(AMLProvider):
+    name = "Ethplorer"
     def check(self, address: str, network: str = None) -> dict:
-        # network может быть TRX или USDT_TRC20
+        if network not in ("ETH", "USDT_ERC20"):
+            return None
+        url = f"https://api.ethplorer.io/getAddressInfo/{address}?apiKey=freekey"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Ethplorer returned {resp.status_code}")
+                return None
+            data = resp.json()
+            if not data.get("address"):
+                return None
+            balance = data.get("ETH", {}).get("balance", 0)  # в ETH
+            tx_count = data.get("countTxs", 0)
+            # Ethplorer не даёт дату первой транзакции, попробуем получить из data.get("lastTx")? нет
+            age_days = None  # не знаем
+
+            risk_score = 0
+            details = []
+            # Возраст неизвестен – штрафуем
+            risk_score += 20
+            details.append("Возраст адреса неизвестен")
+
+            if tx_count == 0:
+                risk_score += 40
+                details.append("Нет транзакций")
+            elif tx_count < 5:
+                risk_score += 20
+                details.append("Мало транзакций (менее 5)")
+            elif tx_count < 20:
+                risk_score += 10
+                details.append("Умеренное количество транзакций")
+
+            # Баланс в ETH
+            if balance > 0 and tx_count < 5:
+                risk_score += 20
+                details.append("Баланс > 0 при малом количестве транзакций")
+
+            risk_score = min(risk_score, 100)
+            risk_level = "Низкий" if risk_score < 30 else ("Средний" if risk_score < 60 else "Высокий")
+            status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
+
+            details_text = details if details else ["Нет явных рисков"]
+            details_text.append(f"Баланс: {balance:.8f} ETH")
+            details_text.append(f"Транзакций: {tx_count}")
+            details_text.append("Возраст: неизвестен")
+
+            return {
+                "source": self.name,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "status": status,
+                "details": details_text,
+                "network": network,
+                "balance": f"{balance:.8f} ETH",
+                "tx_count": tx_count,
+                "age_days": None,
+            }
+        except Exception as e:
+            logger.error(f"Ethplorer exception: {e}")
+            return None
+
+# -------- 3. Blockcypher (резерв для BTC, ETH, LTC, BCH) --------
+class BlockcypherProvider(AMLProvider):
+    name = "Blockcypher"
+    def check(self, address: str, network: str = None) -> dict:
+        net_map = {
+            "BTC": "btc/main",
+            "ETH": "eth/main",
+            "LTC": "ltc/main",
+            "BCH": "bch/main",
+            "USDT_ERC20": "eth/main",
+        }
+        net = net_map.get(network)
+        if not net:
+            return None
+        url = f"https://api.blockcypher.com/v1/{net}/addrs/{address}"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Blockcypher returned {resp.status_code}")
+                return None
+            data = resp.json()
+            if not data.get("address"):
+                return None
+            balance = data.get("balance", 0)  # в сатоши/wei
+            tx_count = data.get("n_tx", 0)
+            # дата первой транзакции отсутствует
+            age_days = None
+
+            risk_score = 0
+            details = []
+            risk_score += 20
+            details.append("Возраст адреса неизвестен")
+
+            if tx_count == 0:
+                risk_score += 40
+                details.append("Нет транзакций")
+            elif tx_count < 5:
+                risk_score += 20
+                details.append("Мало транзакций (менее 5)")
+            elif tx_count < 20:
+                risk_score += 10
+                details.append("Умеренное количество транзакций")
+
+            if network == "BTC":
+                balance_units = balance / 1e8
+                symbol = "BTC"
+            elif network == "ETH" or network == "USDT_ERC20":
+                balance_units = balance / 1e18
+                symbol = "ETH"
+            elif network == "LTC":
+                balance_units = balance / 1e8
+                symbol = "LTC"
+            elif network == "BCH":
+                balance_units = balance / 1e8
+                symbol = "BCH"
+            else:
+                balance_units = 0
+                symbol = ""
+
+            if balance_units > 0 and tx_count < 5:
+                risk_score += 20
+                details.append("Баланс > 0 при малом количестве транзакций")
+
+            risk_score = min(risk_score, 100)
+            risk_level = "Низкий" if risk_score < 30 else ("Средний" if risk_score < 60 else "Высокий")
+            status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
+
+            details_text = details if details else ["Нет явных рисков"]
+            details_text.append(f"Баланс: {balance_units:.8f} {symbol}")
+            details_text.append(f"Транзакций: {tx_count}")
+            details_text.append("Возраст: неизвестен")
+
+            return {
+                "source": self.name,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "status": status,
+                "details": details_text,
+                "network": network,
+                "balance": f"{balance_units:.8f} {symbol}",
+                "tx_count": tx_count,
+                "age_days": None,
+            }
+        except Exception as e:
+            logger.error(f"Blockcypher exception: {e}")
+            return None
+
+# -------- 4. Tronscan (для TRX и USDT_TRC20) --------
+class TronscanProvider(AMLProvider):
+    name = "Tronscan"
+    def check(self, address: str, network: str = None) -> dict:
         if network not in ("TRX", "USDT_TRC20"):
             return None
         url = f"https://api.tronscan.org/api/address?address={address}"
@@ -583,24 +706,19 @@ class TronscanProvider(AMLProvider):
                 logger.warning(f"Tronscan returned {resp.status_code}")
                 return None
             data = resp.json()
-            # Проверяем наличие данных
             if not data.get("address"):
                 return None
-
-            # Извлекаем данные
-            balance = data.get("balance", 0) / 1e6  # TRX имеет 6 знаков
+            balance = data.get("balance", 0) / 1e6
             tx_count = data.get("totalTx", 0)
-            first_tx_time = data.get("firstTxTime")  # миллисекунды Unix
+            first_tx_time = data.get("firstTxTime")
             if first_tx_time:
                 first_date = datetime.fromtimestamp(first_tx_time / 1000)
                 age_days = (datetime.now() - first_date).days
             else:
                 age_days = None
 
-            # Вычисляем риск-скор (аналогично Blockchair)
             risk_score = 0
             details = []
-
             if age_days is not None:
                 if age_days < 7:
                     risk_score += 30
@@ -627,24 +745,13 @@ class TronscanProvider(AMLProvider):
                 details.append("Большой баланс на новом адресе")
 
             risk_score = min(risk_score, 100)
-
-            if risk_score < 30:
-                risk_level = "Низкий"
-                status = "✅ Чистый"
-            elif risk_score < 60:
-                risk_level = "Средний"
-                status = "🟡 Средний"
-            else:
-                risk_level = "Высокий"
-                status = "🔴 Высокий"
+            risk_level = "Низкий" if risk_score < 30 else ("Средний" if risk_score < 60 else "Высокий")
+            status = "✅ Чистый" if risk_score < 30 else ("🟡 Средний" if risk_score < 60 else "🔴 Высокий")
 
             details_text = details if details else ["Нет явных рисков"]
             details_text.append(f"Баланс: {balance:.2f} TRX")
             details_text.append(f"Транзакций: {tx_count}")
-            if age_days is not None:
-                details_text.append(f"Возраст: {age_days} дней")
-            else:
-                details_text.append("Возраст: неизвестен")
+            details_text.append(f"Возраст: {age_days} дней" if age_days is not None else "Возраст: неизвестен")
 
             return {
                 "source": self.name,
@@ -661,15 +768,19 @@ class TronscanProvider(AMLProvider):
             logger.error(f"Tronscan exception: {e}")
             return None
 
-# Список провайдеров (порядок важен: сначала основные, потом резервные)
+# Список провайдеров (порядок: сначала основные, потом резервные)
 aml_providers = [
     BlockchairProvider(),
+    EthplorerProvider(),
+    BlockcypherProvider(),
     TronscanProvider(),
 ]
 
 # ---------- AML-функции ----------
 async def aml_check(address: str, network: str = None) -> dict:
     """Проверяет адрес через все доступные провайдеры. Возвращает результат или None."""
+    # Фильтруем провайдеров по сети, чтобы не пытаться использовать Tronscan для ETH и т.п.
+    # Но лучше просто перебирать всех, они сами вернут None, если сеть не поддерживается.
     for provider in aml_providers:
         try:
             logger.info(f"Trying provider: {provider.name} for address {address[:10]}...")
@@ -712,7 +823,6 @@ def format_aml_report(address: str, result: dict) -> str:
         f"📋 **Статус:** {result.get('status', '❌ Нет данных')}",
         "━━━━━━━━━━━━━━━━━━━",
     ]
-    # Добавляем детали (список строк)
     if result.get("details"):
         for detail in result.get("details"):
             lines.append(f"• {detail}")
@@ -936,18 +1046,11 @@ async def handle_text(message: Message):
             network = "LTC"
         elif re.match(r'^q[a-zA-Z0-9]{41}$', address):
             network = "BCH"
-        # USDT_ERC20 и USDT_TRC20 – это те же адреса ETH и TRX, определим отдельно
-        # Для USDT_ERC20 адрес такой же как ETH, но пользователь может указать USDT_ERC20,
-        # мы автоматически определим как ETH, но в отчёте покажем как USDT_ERC20
-        # Аналогично USDT_TRC20 – как TRX.
         if network:
-            # Если адрес ETH, можем уточнить, что это USDT_ERC20? Но пользователь сам выбрал сеть, если вручную.
-            # В автоматическом режиме мы просто определим сеть и проверим.
             del waiting_for[user_id]
             await perform_aml_check(message, user_id, address, network)
             return
         else:
-            # Не удалось определить сеть – предлагаем выбрать вручную
             await message.answer(
                 "🔍 Не удалось автоматически определить сеть для этого адреса.\n"
                 "Пожалуйста, выберите сеть вручную:",
